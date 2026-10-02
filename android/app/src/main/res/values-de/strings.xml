@@ -51,6 +51,14 @@
 
     <string name="error_headline">Übertragung fehlgeschlagen</string>
 
+    <string name="receiver_broadcasting_as">Sendet als:</string>
+    <string name="receiver_this_device">Dieses Gerät</string>
+    <string name="receiver_discovery_hint">Andere Geräte im selben WLAN können dieses Gerät nun nach Namen finden und Dateien senden.</string>
+    <string name="receiver_off_hint">Gerätenamen oben festlegen und dann den Empfang aktivieren. Sendende Geräte sehen Ihren Namen.</string>
+    <string name="receiver_nearby_devices">GERÄTE IN DER NÄHE</string>
+    <string name="receiver_nearby_body">Sender im selben Netzwerk finden dieses Gerät automatisch nach Namen.</string>
+    <string name="receiver_visible_as_name">Für Sender in der Nähe sichtbar</string>
+
     <string name="receiver_enable">Empfang aktivieren</string>
     <string name="receiver_no_files">Noch keine Dateien empfangen</string>
 
@@ -59,9 +67,8 @@
 
     <string name="msg_notification_permission">Benachrichtigungsberechtigung für Hintergrundübertragungen erforderlich</string>
     <string name="msg_receiver_started">Empfänger gestartet – sendet als „%1$s“</string>
-    <string name="msg_receiver_start_failed">Server konnte nicht gestartet werden (Port belegt?)</string>
+    <string name="msg_receiver_start_failed">Empfänger konnte nicht gestartet werden. Möglicherweise wird der Port von einer anderen App verwendet.</string>
     <string name="msg_receiver_stopped">Empfangsserver gestoppt</string>
-    <string name="msg_ip_refreshed">IP aktualisiert: %1$s</string>
     <string name="msg_files_saved_in">Dateien gespeichert unter Downloads/NexusFlow</string>
     <string name="msg_pick_to_resume_history">Bitte „%1$s“ wählen, um die Übertragung fortzusetzen</string>
     <string name="msg_select_file_to_resume">Bitte die Datei vom Gerät zum Fortsetzen wählen</string>

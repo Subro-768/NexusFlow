@@ -76,7 +76,6 @@ class MainActivity : ComponentActivity() {
     private var selectedFileUri by mutableStateOf<Uri?>(null)
 
     private var isReceiverRunning by mutableStateOf(false)
-    private var receiverIps by mutableStateOf<List<String>>(listOf("127.0.0.1"))
     private var recentTargetIps by mutableStateOf<List<String>>(emptyList())
     private var deviceName by mutableStateOf("")
     private var discoveredPeers by mutableStateOf<List<PeerDevice>>(emptyList())
@@ -193,7 +192,6 @@ class MainActivity : ComponentActivity() {
         TransferForegroundService.transferManagerInstance = transferManager
 
         embeddedServer = EmbeddedTransferServer(applicationContext, 8000)
-        receiverIps = embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
 
         // Initialize NSD helper for device discovery
         nsdHelper = NsdHelper(applicationContext)
@@ -415,17 +413,17 @@ class MainActivity : ComponentActivity() {
                             ScreenNav.RECEIVER -> {
                                 ReceiverScreen(
                                     isServerRunning = isReceiverRunning,
-                                    localIps = receiverIps,
                                     incomingState = incomingTransfer,
                                     onToggleServer = { shouldRun ->
                                         if (shouldRun) {
                                             val started = embeddedServer?.start() ?: false
                                             isReceiverRunning = started
                                             if (started) {
-                                                receiverIps = embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
-                                                // Register NSD service so senders can discover this device by name
+                                                // Register NSD so senders discover this device
+                                                // by name. The address is never shown on
+                                                // screen -- peers resolve it over mDNS.
                                                 val name = deviceName.ifBlank { transferManager.getDeviceName() }
-                                                nsdHelper?.registerService(name, 8000)
+                                                nsdHelper?.registerService(name, DEFAULT_PORT)
                                                 notifyUser(getString(R.string.msg_receiver_started, name))
                                             } else {
                                                 notifyUser(getString(R.string.msg_receiver_start_failed))
@@ -436,10 +434,6 @@ class MainActivity : ComponentActivity() {
                                             isReceiverRunning = false
                                             notifyUser(getString(R.string.msg_receiver_stopped))
                                         }
-                                    },
-                                    onRefreshIp = {
-                                        receiverIps = embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
-                                        notifyUser(getString(R.string.msg_ip_refreshed, receiverIps.firstOrNull() ?: "127.0.0.1"))
                                     },
                                     onMenuClick = { scope.launch { drawerState.open() } },
                                     onOpenDownloads = { openReceivedDownloadsFolder() },

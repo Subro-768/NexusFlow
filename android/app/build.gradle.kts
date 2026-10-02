@@ -56,7 +56,4 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
     implementation(libs.kotlinx.coroutines.android)
-
-    // QR Code generation
-    implementation("com.google.zxing:core:3.5.3")
 }

@@ -4,8 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Environment
 import android.webkit.MimeTypeMap
@@ -30,7 +28,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -44,12 +41,10 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.EncodeHintType
-import com.google.zxing.qrcode.QRCodeWriter
 import com.resumabletransfer.app.R
 import com.resumabletransfer.app.server.IncomingTransferState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
@@ -59,45 +54,22 @@ import java.util.*
 @Composable
 fun ReceiverScreen(
     isServerRunning: Boolean,
-    localIps: List<String>,
     incomingState: IncomingTransferState?,
     onToggleServer: (Boolean) -> Unit,
-    onRefreshIp: () -> Unit,
     onMenuClick: () -> Unit,
     onOpenDownloads: () -> Unit,
     deviceName: String = "",
     onDeviceNameChange: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
-    val primaryIp = localIps.firstOrNull { !it.startsWith("127.") } ?: localIps.firstOrNull() ?: "127.0.0.1"
-
-    /**
-     * QR generation off the main thread.
-     *
-     * `generateQrCode` is a 512x512 per-pixel `setPixel` loop -- 262,144 JNI
-     * calls. It used to run inside `remember {}`, i.e. during composition on the
-     * UI thread, so flipping the receiver switch visibly janked (and risked an
-     * ANR). `produceState` moves it to a background dispatcher and caches the
-     * result.
-     */
-    val qrBitmap by produceState<Bitmap?>(initialValue = null, primaryIp, isServerRunning) {
-        if (!isServerRunning) {
-            value = null
-            return@produceState
-        }
-        value = withContext(Dispatchers.Default) { generateQrCode(primaryIp, 512) }
-    }
 
     var receivedFiles by remember { mutableStateOf(listOf<ReceivedFileInfo>()) }
-
-    fun refreshFileList() {
-        receivedFiles = scanReceivedFiles(context)
-    }
 
     // The scan does listFiles() + a stat per entry; it belongs on IO, not the
     // main dispatcher. The loading flag keeps the previous "empty" text from
     // flashing while the listing is in flight.
     var filesLoading by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
     LaunchedEffect(incomingState?.status) {
         filesLoading = true
         receivedFiles = withContext(Dispatchers.IO) { scanReceivedFiles(context) }
@@ -142,26 +114,18 @@ fun ReceiverScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onMenuClick) {
-                        Icon(Icons.Default.Menu, contentDescription = "Open navigation menu", tint = SoloraTextPrimary)
+                    IconButton(onClick = onMenuClick, modifier = Modifier.size(48.dp)) {
+                        Icon(
+                            Icons.Default.Menu,
+                            contentDescription = stringResource(R.string.cd_open_menu),
+                            tint = SoloraTextPrimary
+                        )
                     }
                 },
                 actions = {
-                    IconButton(
-                        onClick = onRefreshIp,
-                        modifier = Modifier
-                            .padding(end = 4.dp)
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(SoloraSurfaceElevated)
-                    ) {
-                        Icon(
-                            Icons.Default.Refresh,
-                            contentDescription = stringResource(R.string.cd_refresh_ip),
-                            tint = SoloraCyan,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
+                    // The old action row had a "Refresh IP" button. With the
+                    // address no longer displayed there is nothing to refresh,
+                    // so only the downloads action remains.
                     IconButton(
                         onClick = onOpenDownloads,
                         modifier = Modifier
@@ -314,55 +278,32 @@ fun ReceiverScreen(
                                 )
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        "Broadcasting as:",
-                                        fontSize = 9.sp,
-                                        color = SoloraTextSecondary,
-                                        fontWeight = FontWeight.Medium
+                                        stringResource(R.string.receiver_broadcasting_as),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SoloraTextSecondary
                                     )
                                     Text(
-                                        deviceName.ifBlank { "This Device" },
+                                        deviceName.ifBlank { stringResource(R.string.receiver_this_device) },
                                         fontSize = 15.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = SoloraEnergyGreen
+                                        color = SoloraEnergyGreen,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
                                     )
-                                }
-                                // Secondary: small IP badge
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = SoloraSurfaceElevated
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        IconButton(
-                                            onClick = { onRefreshIp() },
-                                            modifier = Modifier.size(20.dp)
-                                        ) {
-                                            Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = SoloraCyan, modifier = Modifier.size(14.dp))
-                                        }
-                                        Text(
-                                            "$primaryIp:8000",
-                                            fontSize = 9.sp,
-                                            fontFamily = FontFamily.Monospace,
-                                            color = SoloraTextMuted
-                                        )
-                                    }
                                 }
                             }
                         }
 
                         Text(
-                            "Other devices on the same Wi-Fi can now discover and send files to you.",
-                            fontSize = 11.sp,
+                            stringResource(R.string.receiver_discovery_hint),
+                            style = MaterialTheme.typography.bodySmall,
                             color = SoloraTextSecondary,
                             lineHeight = 16.sp
                         )
                     } else {
                         Text(
-                            "Set your device name above, then enable receiving. Nearby senders will see your name instead of your IP address.",
-                            fontSize = 11.sp,
+                            stringResource(R.string.receiver_off_hint),
+                            style = MaterialTheme.typography.bodySmall,
                             color = SoloraTextMuted,
                             lineHeight = 16.sp
                         )
@@ -370,9 +311,15 @@ fun ReceiverScreen(
                 }
             }
 
-
-            // 2. QR Code Pairing Card
-            if (isServerRunning && qrBitmap != null) {
+            // 2. Nearby devices -- name only.
+            //
+            // The IP address is deliberately NOT shown. This screen used to
+            // print "192.168.x.x:8000" in a badge, again under a "QUICK PAIRING
+            // IP" heading, and again inside a scannable QR bitmap. That leaked
+            // the device's address to anyone shoulder-surfing, to screenshots,
+            // and to the recents-app thumbnail. Peers are found over mDNS/NSD
+            // anyway, so the address is never needed on screen.
+            if (isServerRunning) {
                 Surface(
                     shape = RoundedCornerShape(24.dp),
                     color = SoloraSurfaceCard,
@@ -382,45 +329,66 @@ fun ReceiverScreen(
                     Column(
                         modifier = Modifier.padding(20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text(
-                            "QUICK PAIRING IP",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = SoloraCyan,
-                            letterSpacing = 1.sp
-                        )
-
-                        Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = androidx.compose.ui.graphics.Color.White,
-                            modifier = Modifier
-                                .size(170.dp)
-                                .padding(4.dp)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            // qrBitmap is a delegated property (from produceState),
-                            // so it cannot be smart-cast; bind it to a local first.
-                            val bitmap = qrBitmap
-                            if (bitmap != null) {
-                                Image(
-                                    bitmap = bitmap.asImageBitmap(),
-                                    contentDescription = stringResource(
-                                        R.string.cd_qr_code,
-                                        primaryIp
-                                    ),
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
+                            Icon(
+                                Icons.Default.Wifi,
+                                contentDescription = null,
+                                tint = SoloraCyan,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                stringResource(R.string.receiver_nearby_devices),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SoloraCyan
+                            )
                         }
 
                         Text(
-                            primaryIp,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = SoloraNeonLime
+                            stringResource(R.string.receiver_nearby_body),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SoloraTextSecondary,
+                            textAlign = TextAlign.Center,
+                            lineHeight = 16.sp
                         )
+
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = SoloraSurfaceElevated,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.PhoneAndroid,
+                                    contentDescription = null,
+                                    tint = SoloraEnergyGreen,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Column {
+                                    Text(
+                                        deviceName.ifBlank { stringResource(R.string.receiver_this_device) },
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        color = SoloraTextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        stringResource(R.string.receiver_visible_as_name),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = SoloraTextMuted
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -540,13 +508,27 @@ fun ReceiverScreen(
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             IconButton(
-                                onClick = { refreshFileList() },
+                                onClick = {
+                                    // Re-scan on IO; a manual refresh must not
+                                    // stat every file on the main thread.
+                                    filesLoading = true
+                                    coroutineScope.launch {
+                                        receivedFiles =
+                                            withContext(Dispatchers.IO) { scanReceivedFiles(context) }
+                                        filesLoading = false
+                                    }
+                                },
                                 modifier = Modifier
-                                    .size(32.dp)
+                                    .size(48.dp)
                                     .clip(CircleShape)
                                     .background(SoloraSurfaceElevated)
                             ) {
-                                Icon(Icons.Default.Refresh, contentDescription = "Refresh files", tint = SoloraCyan, modifier = Modifier.size(16.dp))
+                                Icon(
+                                    Icons.Default.Refresh,
+                                    contentDescription = stringResource(R.string.cd_refresh),
+                                    tint = SoloraCyan,
+                                    modifier = Modifier.size(16.dp)
+                                )
                             }
                             IconButton(
                                 onClick = onOpenDownloads,
@@ -719,21 +701,5 @@ fun openFileWithSystemViewer(context: Context, file: File) {
         context.startActivity(Intent.createChooser(intent, "Open file with..."))
     } catch (e: Exception) {
         Toast.makeText(context, "Could not open file: ${e.message}", Toast.LENGTH_SHORT).show()
-    }
-}
-
-fun generateQrCode(text: String, size: Int): Bitmap? {
-    return try {
-        val hints = mapOf(EncodeHintType.MARGIN to 1)
-        val bitMatrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size, hints)
-        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
-        for (x in 0 until size) {
-            for (y in 0 until size) {
-                bitmap.setPixel(x, y, if (bitMatrix.get(x, y)) AndroidColor.BLACK else AndroidColor.WHITE)
-            }
-        }
-        bitmap
-    } catch (e: Exception) {
-        null
     }
 }

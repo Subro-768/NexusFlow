@@ -78,13 +78,19 @@
     <!-- Errors -->
     <string name="error_headline">Transfer failed</string>
 
+    <!-- Receiver: no IP addresses are shown anywhere in the UI -->
+    <string name="receiver_broadcasting_as">Broadcasting as:</string>
+    <string name="receiver_this_device">This Device</string>
+    <string name="receiver_discovery_hint">Other devices on the same Wi-Fi can now discover this device by name and send files to you.</string>
+    <string name="receiver_off_hint">Set your device name above, then enable receiving. Nearby senders will see your name.</string>
+    <string name="receiver_nearby_devices">NEARBY DEVICES</string>
+    <string name="receiver_nearby_body">Senders on the same network will find this device automatically by name.</string>
+    <string name="receiver_visible_as_name">Visible to nearby senders</string>
+
     <!-- Receiver -->
     <string name="receiver_enable">Enable Receiving</string>
-    <string name="receiver_refresh_ip">Refresh IP</string>
-    <string name="cd_refresh_ip">Refresh local IP address</string>
     <string name="cd_open_downloads">Open downloads folder</string>
     <string name="receiver_no_files">No files received yet</string>
-    <string name="cd_qr_code">Connection QR code for %1$s</string>
 
     <!-- Settings -->
     <string name="settings_title">Settings</string>
@@ -94,9 +100,8 @@
     <!-- Toast / snackbar messages -->
     <string name="msg_notification_permission">Notification permission needed for background transfers</string>
     <string name="msg_receiver_started">Receiver Started — Broadcasting as \"%1$s\"</string>
-    <string name="msg_receiver_start_failed">Failed to start server (port in use?)</string>
+    <string name="msg_receiver_start_failed">Could not start the receiver. Another app may be using the port.</string>
     <string name="msg_receiver_stopped">Receiver Server Stopped</string>
-    <string name="msg_ip_refreshed">IP Refreshed: %1$s</string>
     <string name="msg_files_saved_in">Files saved in Downloads/NexusFlow</string>
     <string name="msg_pick_to_resume_history">Please pick \'%1$s\' to resume bytes</string>
     <string name="msg_select_file_to_resume">Please select the file from device to resume</string>
