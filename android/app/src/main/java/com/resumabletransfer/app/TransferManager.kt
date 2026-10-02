@@ -69,6 +69,14 @@ class TransferManager private constructor(private val context: Context) {
     @Volatile
     private var lastEmitAt = 0L
 
+    /** Peer currently being sent to; used to file history under the right device. */
+    @Volatile
+    private var currentPeerName: String = ""
+    @Volatile
+    private var currentPeerHost: String = ""
+    @Volatile
+    private var currentPeerPort: Int = 8000
+
     private var transferJob: Job? = null
     private var activeApiClient: TransferApiClient? = null
     @Volatile private var isPaused = false
@@ -216,7 +224,8 @@ class TransferManager private constructor(private val context: Context) {
         uri: Uri,
         filename: String,
         fileSize: Long,
-        existingTransferId: String? = null
+        existingTransferId: String? = null,
+        peerDisplayName: String = ""
     ) {
         val chunkSize = getChunkSizeKb() * 1024
         val throttleDelay = getThrottleDelayMs()
@@ -229,6 +238,13 @@ class TransferManager private constructor(private val context: Context) {
         isCancelled = false
 
         saveFileSelection(uri, filename, fileSize)
+
+        // Remember who we are talking to, so the completed transfer can be filed
+        // under this peer in the device-local history. The name is captured at
+        // start because the discovered peer list may change mid-transfer.
+        currentPeerHost = Uri.parse(serverUrl).host ?: serverUrl
+        currentPeerPort = Uri.parse(serverUrl).port.takeIf { it > 0 } ?: 8000
+        currentPeerName = peerDisplayName
 
         transferJob = coroutineScope.launch {
             val client = TransferApiClient(serverUrl)
@@ -470,6 +486,27 @@ class TransferManager private constructor(private val context: Context) {
                                     }
                                 )
                             }
+
+                            // Persist to device-local history so the History
+                            // screen can show every transfer ever made, not just
+                            // those for whichever peer is currently selected.
+                            if (isFinal) {
+                                HistoryStore.get(context).upsert(
+                                    HistoryEntry(
+                                        id = transferId ?: filename,
+                                        peerName = currentPeerName,
+                                        peerHost = currentPeerHost,
+                                        port = currentPeerPort,
+                                        filename = filename,
+                                        totalBytes = fileSize,
+                                        transferredBytes = confirmedOffset,
+                                        status = if (result.sha256Verified) "COMPLETED" else "FAILED",
+                                        timestampMillis = System.currentTimeMillis(),
+                                        direction = HistoryEntry.DIRECTION_SENT,
+                                        sha256 = result.calculatedSha256
+                                    )
+                                )
+                            }
                         } else {
                             retryCount++
                             val err = uploadRes.exceptionOrNull()?.localizedMessage ?: "Network connection lost"
@@ -577,11 +614,17 @@ class TransferManager private constructor(private val context: Context) {
         updateProgress { it.copy(status = TransferStatus.PAUSED, logMessage = "Transfer paused.") }
     }
 
-    fun resumeTransfer(serverUrl: String, uri: Uri, filename: String, fileSize: Long) {
+    fun resumeTransfer(
+        serverUrl: String,
+        uri: Uri,
+        filename: String,
+        fileSize: Long,
+        peerDisplayName: String = ""
+    ) {
         val currentTransferId = _progressState.value.transferId.ifEmpty {
             prefs.getString(KEY_TRANSFER_ID, null)
         }
-        startTransfer(serverUrl, uri, filename, fileSize, currentTransferId)
+        startTransfer(serverUrl, uri, filename, fileSize, currentTransferId, peerDisplayName)
     }
 
     fun cancelTransfer() {

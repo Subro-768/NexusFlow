@@ -120,7 +120,12 @@
     <string name="cd_refresh">Refresh</string>
     <string name="cd_open">Open</string>
     <string name="history_empty">No transfers recorded yet</string>
-    <string name="history_resume">Resume</string>
+    <string name="history_resume">RESUME</string>
+    <string name="history_back">Back</string>
+    <string name="history_sent">sent</string>
+    <string name="history_received">received</string>
+    <string name="history_file_count">%1$d files</string>
+    <string name="history_peer_summary">%1$d files  ·  %2$s total</string>
 
     <!-- Formatting: keep decimal point locale-independent for byte math -->
     <string name="fmt_bytes_format">%1$s %2$s</string>

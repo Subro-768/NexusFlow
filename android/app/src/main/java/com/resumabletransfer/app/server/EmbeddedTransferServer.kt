@@ -11,6 +11,8 @@ import org.json.JSONObject
 import java.io.*
 import java.net.*
 import java.security.MessageDigest
+import com.resumabletransfer.app.HistoryEntry
+import com.resumabletransfer.app.HistoryStore
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -24,7 +26,8 @@ data class IncomingTransferState(
     val speedBytesPerSec: Long = 0,
     val calculatedSha256: String? = null,
     val sha256Verified: Boolean = false,
-    val filePath: String? = null
+    val filePath: String? = null,
+    val senderName: String? = null
 )
 
 class EmbeddedTransferServer(private val context: Context, private val port: Int = 8000) {
@@ -49,7 +52,8 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
         var status: String,
         val expectedSha256: String?,
         var calculatedSha256: String? = null,
-        val targetFile: File
+        val targetFile: File,
+        val senderName: String = ""
     )
 
     fun start(): Boolean {
@@ -183,6 +187,14 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             reqJson.has("sha256") && !reqJson.isNull("sha256") -> reqJson.getString("sha256")
             else -> null
         }
+        // Sender's advertised device name, used to group this file under a
+        // device in the receiver's history. Falls back to blank if absent.
+        val senderName = headers.entries
+            .firstOrNull { it.key.equals("X-Sender-Name", ignoreCase = true) }
+            ?.value
+            ?.take(64)
+            ?.filter { it.isLetterOrDigit() || it == ' ' || it == '-' || it == '_' }
+            ?: ""
 
         // Sanitize filename
         val cleanName = File(rawFilename).name.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
@@ -203,7 +215,8 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             receivedBytes = 0,
             status = "PENDING",
             expectedSha256 = expectedSha256,
-            targetFile = targetFile
+            targetFile = targetFile,
+            senderName = senderName
         )
         transfers[transferId] = record
 
@@ -213,7 +226,8 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             totalSize = totalSize,
             receivedBytes = 0,
             status = "PENDING",
-            filePath = targetFile.absolutePath
+            filePath = targetFile.absolutePath,
+            senderName = senderName.ifBlank { null }
         )
 
         val resp = JSONObject().apply {
@@ -293,6 +307,31 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             }
         }
 
+        // Persist to the device-local history exactly once, on the transition
+        // into a terminal state. HistoryStore de-duplicates on transferId, so a
+        // repeated completion is harmless.
+        if (record.status == "COMPLETED" || record.status == "FAILED") {
+            try {
+                HistoryStore.get(context).upsert(
+                    HistoryEntry(
+                        id = transferId,
+                        peerName = record.senderName,
+                        peerHost = record.senderName,
+                        port = port,
+                        filename = record.filename,
+                        totalBytes = record.totalSize,
+                        transferredBytes = record.receivedBytes,
+                        status = record.status,
+                        timestampMillis = System.currentTimeMillis(),
+                        direction = HistoryEntry.DIRECTION_RECEIVED,
+                        sha256 = record.calculatedSha256
+                    )
+                )
+            } catch (e: Exception) {
+                Log.w(tag, "history upsert failed: ${e.message}")
+            }
+        }
+
         _incomingState.value = IncomingTransferState(
             transferId = transferId,
             filename = record.filename,
@@ -302,7 +341,8 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             speedBytesPerSec = speed,
             calculatedSha256 = record.calculatedSha256,
             sha256Verified = verified,
-            filePath = record.targetFile.absolutePath
+            filePath = record.targetFile.absolutePath,
+            senderName = record.senderName.ifBlank { null }
         )
 
         val resp = JSONObject().apply {

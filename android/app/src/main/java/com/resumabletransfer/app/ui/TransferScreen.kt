@@ -111,19 +111,11 @@ private val MinTouchTarget = 48.dp
 fun TransferScreen(
     onMenuClick: () -> Unit,
     serverIp: String,
-    onServerIpChange: (String) -> Unit,
-    serverPort: String,
-    onServerPortChange: (String) -> Unit,
-    recentIps: List<String> = emptyList(),
-    onSelectRecentIp: (String) -> Unit = {},
     discoveredPeers: List<PeerDevice> = emptyList(),
     onSelectPeer: (PeerDevice) -> Unit = {},
     onRefreshPeers: () -> Unit = {},
     onScanQr: () -> Unit = {},
     isDiscovering: Boolean = false,
-    onTestConnection: () -> Unit,
-    connectionStatusText: String,
-    isConnected: Boolean,
     selectedFileName: String?,
     selectedFileSize: Long?,
     selectedFileUri: Uri?,
@@ -144,20 +136,7 @@ fun TransferScreen(
         topBar = {
             NexusTopBar(
                 subtitle = stringResource(R.string.brand_tagline),
-                onMenuClick = onMenuClick,
-                actions = {
-                    IconButton(
-                        onClick = onNewTransfer,
-                        modifier = Modifier.size(MinTouchTarget)
-                    ) {
-                        Icon(
-                            Icons.Default.Add,
-                            contentDescription = stringResource(R.string.cd_new_transfer),
-                            tint = SoloraNeonLime,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
+                onMenuClick = onMenuClick
             )
         }
     ) { paddingValues ->
@@ -183,18 +162,6 @@ fun TransferScreen(
                 selectedFileName = selectedFileName,
                 selectedFileSize = selectedFileSize,
                 onPickFile = onPickFile
-            )
-
-            EndpointCard(
-                serverIp = serverIp,
-                onServerIpChange = onServerIpChange,
-                serverPort = serverPort,
-                onServerPortChange = onServerPortChange,
-                recentIps = recentIps,
-                onSelectRecentIp = onSelectRecentIp,
-                connectionStatusText = connectionStatusText,
-                isConnected = isConnected,
-                onTestConnection = onTestConnection
             )
 
             PeerDiscoveryPanel(
@@ -227,11 +194,9 @@ fun NexusTopBar(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Image(
-                    painter = painterResource(id = R.drawable.ic_nexus_flow),
-                    contentDescription = stringResource(R.string.cd_logo),
-                    modifier = Modifier.size(34.dp)
-                )
+                // The logo bitmap was removed on request: the wordmark alone
+                // identifies the app, and it also removes a broken-image risk in
+                // the packaged build.
                 Column {
                     Text(
                         text = buildAnnotatedString {
@@ -771,132 +736,6 @@ private fun PayloadSourceCard(
     }
 }
 
-@Composable
-private fun EndpointCard(
-    serverIp: String,
-    onServerIpChange: (String) -> Unit,
-    serverPort: String,
-    onServerPortChange: (String) -> Unit,
-    recentIps: List<String>,
-    onSelectRecentIp: (String) -> Unit,
-    connectionStatusText: String,
-    isConnected: Boolean,
-    onTestConnection: () -> Unit
-) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.large,
-        color = SoloraSurfaceCard,
-        border = BorderStroke(1.dp, SoloraBorder)
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                SectionHeader(
-                    icon = { tint ->
-                        Icon(
-                            Icons.Default.Lan,
-                            contentDescription = null,
-                            tint = tint,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    },
-                    title = stringResource(R.string.card_target_endpoint),
-                    tint = SoloraCyan
-                )
-
-                if (connectionStatusText.isNotEmpty()) {
-                    ConnectionBadge(connectionStatusText, isConnected)
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedTextField(
-                    value = serverIp,
-                    onValueChange = onServerIpChange,
-                    label = { Text(stringResource(R.string.label_device_ip), style = LabelTiny) },
-                    placeholder = { Text(stringResource(R.string.hint_device_ip)) },
-                    singleLine = true,
-                    shape = MaterialTheme.shapes.small,
-                    modifier = Modifier.weight(2.2f),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = SoloraNeonLime,
-                        unfocusedBorderColor = SoloraBorder,
-                        focusedLabelColor = SoloraNeonLime
-                    )
-                )
-                OutlinedTextField(
-                    value = serverPort,
-                    onValueChange = onServerPortChange,
-                    label = { Text(stringResource(R.string.label_port), style = LabelTiny) },
-                    placeholder = { Text(stringResource(R.string.hint_port)) },
-                    singleLine = true,
-                    shape = MaterialTheme.shapes.small,
-                    modifier = Modifier.weight(1f),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = SoloraNeonLime,
-                        unfocusedBorderColor = SoloraBorder,
-                        focusedLabelColor = SoloraNeonLime
-                    )
-                )
-            }
-
-            // Previously the recent-IP list was threaded through MainActivity and
-            // persisted to prefs, but never rendered. It is the fastest way back
-            // to a known-good host, so it now appears here.
-            if (recentIps.isNotEmpty()) {
-                Text(
-                    stringResource(R.string.recent_targets),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = SoloraTextMuted
-                )
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(recentIps, key = { it }) { ip ->
-                        OutlinedButton(
-                            onClick = { onSelectRecentIp(ip) },
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.heightIn(min = 40.dp)
-                        ) {
-                            Text(ip, style = MaterialTheme.typography.labelSmall)
-                        }
-                    }
-                }
-            }
-
-            OutlinedButton(
-                onClick = onTestConnection,
-                shape = MaterialTheme.shapes.small,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp),
-                border = BorderStroke(1.dp, SoloraBorder)
-            ) {
-                Icon(
-                    Icons.Default.Refresh,
-                    contentDescription = null,
-                    tint = SoloraTextSecondary,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    stringResource(R.string.btn_ping_server),
-                    color = SoloraTextSecondary,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp
-                )
-            }
-        }
-    }
-}
 
 @Composable
 private fun SectionHeader(

@@ -84,7 +84,8 @@ class TransferApiClient(private val serverUrl: String) {
         filename: String,
         filesize: Long,
         checksum: String?,
-        chunkSize: Int = 1048576
+        chunkSize: Int = 1048576,
+        senderName: String? = null
     ): Result<TransferSession> {
         val json = JSONObject().apply {
             put("filename", filename)
@@ -95,10 +96,16 @@ class TransferApiClient(private val serverUrl: String) {
             put("chunk_size", chunkSize)
         }
 
-        val request = Request.Builder()
+        val builder = Request.Builder()
             .url("$serverUrl/transfer")
             .post(json.toString().toRequestBody("application/json".toMediaType()))
-            .build()
+
+        // Lets the receiver label this transfer with our device name instead of
+        // a bare address, so the history screen can group by device.
+        if (!senderName.isNullOrBlank()) {
+            builder.addHeader("X-Sender-Name", senderName)
+        }
+        val request = builder.build()
 
         return try {
             client.newCall(request).execute().use { response ->

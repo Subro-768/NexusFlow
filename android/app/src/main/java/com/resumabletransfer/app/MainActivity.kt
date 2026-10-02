@@ -23,6 +23,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +37,7 @@ import com.resumabletransfer.app.server.EmbeddedTransferServer
 import com.resumabletransfer.app.ui.ReceiverScreen
 import com.resumabletransfer.app.ui.ResumableTransferTheme
 import com.resumabletransfer.app.ui.SettingsScreen
+import com.resumabletransfer.app.ui.PeerDetailScreen
 import com.resumabletransfer.app.ui.TransferHistoryScreen
 import com.resumabletransfer.app.ui.TransferScreen
 import com.resumabletransfer.app.ui.formatFileSize
@@ -76,10 +78,15 @@ class MainActivity : ComponentActivity() {
     private var selectedFileUri by mutableStateOf<Uri?>(null)
 
     private var isReceiverRunning by mutableStateOf(false)
-    private var recentTargetIps by mutableStateOf<List<String>>(emptyList())
     private var deviceName by mutableStateOf("")
     private var discoveredPeers by mutableStateOf<List<PeerDevice>>(emptyList())
     private var isDiscovering by mutableStateOf(false)
+
+    /** Name of the peer currently selected as target, for history grouping. */
+    private var selectedPeerName by mutableStateOf("")
+
+    /** Non-null while the History screen is drilled into one device. */
+    private var selectedPeerHistory by mutableStateOf<PeerHistory?>(null)
 
     /**
      * Feedback channel. Every `Toast.makeText` call in this Activity (there
@@ -199,7 +206,6 @@ class MainActivity : ComponentActivity() {
         // Restore saved server settings
         serverIp = transferManager.getSavedServerIp()
         serverPort = transferManager.getSavedServerPort()
-        recentTargetIps = transferManager.getRecentIps()
         deviceName = transferManager.getDeviceName()
 
         // Start peer discovery immediately (sender view)
@@ -252,31 +258,35 @@ class MainActivity : ComponentActivity() {
                             drawerShape = RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp)
                         ) {
                             Spacer(Modifier.height(24.dp))
-                            Row(
+                            Column(
                                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(14.dp)
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
                             ) {
-                                androidx.compose.foundation.Image(
-                                    painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_nexus_flow),
-                                    contentDescription = "Nexus Flow Logo",
-                                    modifier = Modifier.size(38.dp)
-                                )
                                 Column {
                                     Text(
                                         text = buildAnnotatedString {
-                                            withStyle(SpanStyle(color = com.resumabletransfer.app.ui.SoloraCyan, fontWeight = FontWeight.Black)) {
-                                                append("NEXUS ")
+                                            withStyle(
+                                                SpanStyle(
+                                                    color = com.resumabletransfer.app.ui.SoloraCyan,
+                                                    fontWeight = FontWeight.Black
+                                                )
+                                            ) {
+                                                append(stringResource(R.string.brand_name_full))
                                             }
-                                            withStyle(SpanStyle(color = com.resumabletransfer.app.ui.SoloraEnergyGreen, fontWeight = FontWeight.Black)) {
-                                                append("FLOW")
+                                            withStyle(
+                                                SpanStyle(
+                                                    color = com.resumabletransfer.app.ui.SoloraEnergyGreen,
+                                                    fontWeight = FontWeight.Black
+                                                )
+                                            ) {
+                                                append(stringResource(R.string.brand_name_accent))
                                             }
                                         },
                                         fontSize = 18.sp,
                                         letterSpacing = 1.sp
                                     )
                                     Text(
-                                        "SMART FILE TRANSFER",
+                                        stringResource(R.string.brand_tagline),
                                         fontSize = 10.sp,
                                         color = com.resumabletransfer.app.ui.SoloraTextSecondary,
                                         fontWeight = FontWeight.SemiBold,
@@ -337,18 +347,12 @@ class MainActivity : ComponentActivity() {
 
                             Spacer(Modifier.weight(1f))
 
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(16.dp),
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant
-                            ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Text("Connected Server", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text("http://$serverIp:$serverPort", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                }
-                            }
+                            // The "Connected Server" footer used to print the raw
+                            // endpoint URL, which put the LAN address of the
+                            // device this app was pointed at directly on screen.
+                            // Peers are already selected from the nearby-devices
+                            // list, so the block was redundant as well as a
+                            // disclosure. Removed on request.
                         }
                     }
                 ) {
@@ -367,36 +371,18 @@ class MainActivity : ComponentActivity() {
                                 TransferScreen(
                                     onMenuClick = { scope.launch { drawerState.open() } },
                                     serverIp = serverIp,
-                                    onServerIpChange = {
-                                        serverIp = it
-                                        transferManager.setSavedServerIp(it)
-                                    },
-                                    serverPort = serverPort,
-                                    onServerPortChange = {
-                                        serverPort = it
-                                        transferManager.setSavedServerPort(it)
-                                    },
-                                    recentIps = recentTargetIps,
-                                    onSelectRecentIp = { ip ->
-                                        serverIp = ip
-                                        transferManager.setSavedServerIp(ip)
-                                        testConnection()
-                                    },
                                     discoveredPeers = discoveredPeers,
                                     isDiscovering = isDiscovering,
                                     onSelectPeer = { peer ->
                                         serverIp = peer.host
                                         serverPort = peer.port.toString()
+                                        selectedPeerName = peer.name
                                         transferManager.setSavedServerIp(peer.host)
                                         transferManager.setSavedServerPort(peer.port.toString())
                                         testConnection()
                                     },
-                                    // These two were empty-bodied buttons before.
                                     onRefreshPeers = { startPeerDiscovery() },
                                     onScanQr = { showPairingCodeDialog() },
-                                    onTestConnection = { testConnection() },
-                                    connectionStatusText = connectionStatusText,
-                                    isConnected = isConnected,
                                     selectedFileName = if (displayName.isNotEmpty()) displayName else null,
                                     selectedFileSize = if (displaySize > 0) displaySize else null,
                                     selectedFileUri = selectedFileUri,
@@ -445,14 +431,29 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                             ScreenNav.HISTORY -> {
-                                TransferHistoryScreen(
-                                    serverUrl = "http://${serverIp.trim()}:${serverPort.trim()}",
-                                    onMenuClick = { scope.launch { drawerState.open() } },
-                                    onResumeSession = { session ->
-                                        loadAndResumeHistorySession(session)
-                                        currentScreen = ScreenNav.TRANSFER
-                                    }
-                                )
+                                // A peer is open when the user has drilled into it;
+                                // otherwise show the device list.
+                                val openPeer = selectedPeerHistory
+                                if (openPeer != null) {
+                                    PeerDetailScreen(
+                                        peer = openPeer,
+                                        onBack = { selectedPeerHistory = null },
+                                        onResumeSession = { entry ->
+                                            resumeHistoryEntry(entry)
+                                            selectedPeerHistory = null
+                                            currentScreen = ScreenNav.TRANSFER
+                                        }
+                                    )
+                                } else {
+                                    TransferHistoryScreen(
+                                        onMenuClick = { scope.launch { drawerState.open() } },
+                                        onOpenPeer = { selectedPeerHistory = it },
+                                        onResumeSession = { entry ->
+                                            resumeHistoryEntry(entry)
+                                            currentScreen = ScreenNav.TRANSFER
+                                        }
+                                    )
+                                }
                             }
                             ScreenNav.SETTINGS -> {
                                 SettingsScreen(
@@ -507,14 +508,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun loadAndResumeHistorySession(session: TransferApiClient.TransferSession) {
+    /**
+     * Resumes an incomplete send from the history list.
+     *
+     * Now takes a [HistoryEntry] rather than a server session, because history is
+     * read from the device-local store and carries the peer it belongs to — so
+     * the target is restored from the entry rather than whatever peer happens
+     * to be selected right now.
+     */
+    private fun resumeHistoryEntry(entry: HistoryEntry) {
         serverIp = serverIp.trim()
         serverPort = serverPort.trim()
         val url = "http://$serverIp:$serverPort"
 
         val uri = selectedFileUri ?: transferManager.getSavedFileUri()
         if (uri == null) {
-            notifyUser(getString(R.string.msg_pick_to_resume_history, session.filename))
+            notifyUser(getString(R.string.msg_pick_to_resume_history, entry.filename))
             filePickerLauncher.launch(arrayOf("*/*"))
             return
         }
@@ -524,12 +533,12 @@ class MainActivity : ComponentActivity() {
         }
         ContextCompat.startForegroundService(this, serviceIntent)
 
-        transferManager.startTransfer(
+        transferManager.resumeTransfer(
             serverUrl = url,
             uri = uri,
-            filename = session.filename,
-            fileSize = session.totalSize,
-            existingTransferId = session.transferId
+            filename = entry.filename,
+            fileSize = entry.totalBytes,
+            peerDisplayName = entry.peerName.ifBlank { selectedPeerName }
         )
     }
 
@@ -552,13 +561,7 @@ class MainActivity : ComponentActivity() {
             }
             result.onSuccess { info ->
                 isConnected = true
-                connectionStatusText = "Connected (${info.service})"
-                // Save to recent IP history
-                val ip = serverIp.trim()
-                if (ip.isNotEmpty() && ip != "127.0.0.1") {
-                    transferManager.saveRecentIp(ip)
-                    recentTargetIps = transferManager.getRecentIps()
-                }
+                connectionStatusText = getString(R.string.msg_connected, info.service)
             }.onFailure { err ->
                 isConnected = false
                 val reason = err.message ?: "Connection failed"
@@ -577,13 +580,6 @@ class MainActivity : ComponentActivity() {
         val size = selectedFileSize ?: transferManager.getSavedFileSize() ?: return
         val url = "http://${serverIp.trim()}:${serverPort.trim()}"
 
-        // Save to recent IP history on transfer start
-        val ip = serverIp.trim()
-        if (ip.isNotEmpty() && ip != "127.0.0.1") {
-            transferManager.saveRecentIp(ip)
-            recentTargetIps = transferManager.getRecentIps()
-        }
-
         val serviceIntent = Intent(this, TransferForegroundService::class.java).apply {
             action = TransferForegroundService.ACTION_START
         }
@@ -593,7 +589,8 @@ class MainActivity : ComponentActivity() {
             serverUrl = url,
             uri = uri,
             filename = name,
-            fileSize = size
+            fileSize = size,
+            peerDisplayName = selectedPeerName
         )
     }
 
@@ -621,7 +618,8 @@ class MainActivity : ComponentActivity() {
             serverUrl = url,
             uri = uri,
             filename = name,
-            fileSize = size
+            fileSize = size,
+            peerDisplayName = selectedPeerName
         )
     }
 

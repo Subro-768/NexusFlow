@@ -82,5 +82,10 @@
     <string name="pairing_dialog_message">Kopplungscode des empfangenden Geräts einfügen oder eingeben (nexus://host:port).</string>
 
     <string name="history_empty">Noch keine Übertragungen aufgezeichnet</string>
-    <string name="history_resume">Fortsetzen</string>
+    <string name="history_resume">FORTSETZEN</string>
+    <string name="history_back">Zurück</string>
+    <string name="history_sent">gesendet</string>
+    <string name="history_received">empfangen</string>
+    <string name="history_file_count">%1$d Dateien</string>
+    <string name="history_peer_summary">%1$d Dateien  ·  %2$s gesamt</string>
 </resources>
