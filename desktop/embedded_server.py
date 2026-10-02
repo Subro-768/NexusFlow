@@ -10,32 +10,16 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Optional, Callable
 
-HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_history.json")
+try:
+    from storage import record_received_entry
+except ImportError:  # package-relative import when imported as desktop.embedded_server
+    from desktop.storage import record_received_entry
 
-def record_server_history_entry(rec: dict, client_address: tuple):
-    try:
-        history = []
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE, "r") as f:
-                history = json.load(f)
-        
-        entry = {
-            "filename": rec.get("filename", "unknown"),
-            "size": rec.get("total_size", 0),
-            "sha256": rec.get("calculated_sha256", ""),
-            "status": "completed",
-            "timestamp": datetime.now().isoformat(),
-            "transfer_id": rec.get("transfer_id", ""),
-            "target_ip": f"Received from {client_address[0] if client_address else 'device'}",
-            "direction": "received",
-            "file_path": rec.get("file_path", "")
-        }
-        history.insert(0, entry)
-        history = history[:100]
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=2)
-    except Exception:
-        pass
+# The shared transfer-history file is written by this request thread AND by the
+# sender UI.  Both go through storage.py, which serialises the read-modify-write
+# with an flock + atomic replace, so a receive landing during a send's save can no
+# longer be lost.
+record_server_history_entry = record_received_entry
 
 class SpeedTracker:
     def __init__(self):
@@ -55,6 +39,34 @@ class SpeedTracker:
                 self.last_time = now
             return self.current_speed
 
+
+class SpeedTrackerRegistry:
+    """One :class:`SpeedTracker` per transfer_id (was a single server-global one).
+
+    The old single tracker mixed bytes from every concurrent transfer, so the
+    receiver UI showed a throughput number that belonged to no file in
+    particular.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._trackers: Dict[str, SpeedTracker] = {}
+
+    def for_transfer(self, transfer_id: str) -> SpeedTracker:
+        with self._lock:
+            tracker = self._trackers.get(transfer_id)
+            if tracker is None:
+                tracker = self._trackers[transfer_id] = SpeedTracker()
+            return tracker
+
+    def drop(self, transfer_id: str) -> None:
+        with self._lock:
+            self._trackers.pop(transfer_id, None)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._trackers)
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -70,9 +82,33 @@ class EmbeddedReceiverServer:
         self.is_running = False
         
         # In-memory transfer records
+        self._transfers_lock = threading.Lock()
         self.transfers: Dict[str, dict] = {}
         self.state_callback: Optional[Callable[[dict], None]] = None
-        self.speed_tracker = SpeedTracker()
+        # One speed tracker PER transfer (was one shared across all transfers).
+        self.speed_trackers = SpeedTrackerRegistry()
+
+    @property
+    def speed_tracker(self):
+        """Back-compat accessor: tracker for the most recently active transfer."""
+        if not self.transfers:
+            return None
+        tid = next(reversed(self.transfers))
+        return self.speed_trackers.for_transfer(tid)
+
+    def _notify_state(self, rec: dict) -> None:
+        """Fan a transfer-state record out to the UI callback.
+
+        Called on an HTTP request thread.  The GUI connects this to a Qt signal
+        with Qt.QueuedConnection, so the widget work happens on the GUI thread —
+        but a raising callback must never kill the request handler.
+        """
+        if not self.state_callback:
+            return
+        try:
+            self.state_callback(rec)
+        except Exception:
+            pass
 
     def start(self) -> bool:
         if self.is_running:
@@ -150,7 +186,7 @@ class EmbeddedReceiverServer:
     <div class="card">
         <h1><span class="cyan">NEXUS</span> <span class="green">FLOW</span></h1>
         <p style="color:#64748B; font-size:11px; font-weight:bold; letter-spacing:2px; margin-bottom:16px;">RECEIVER ENDPOINT ACTIVE</p>
-        <div class="pill"><span class="green">●</span> Target IP: <span class="lime">{self.headers.get('Host', parent.host + ':8000')}</span></div>
+        <div class="pill"><span class="green">●</span> Target IP: <span class="lime">{self.headers.get('Host', parent.host + ':' + str(parent.port))}</span></div>
         <p>To transfer files, open the <b>Nexus Flow app</b> on your device, enter this target IP, and start transfer.</p>
     </div>
 </body>
@@ -250,8 +286,7 @@ class EmbeddedReceiverServer:
                                 pass
                         
                         parent.transfers[tid] = rec
-                        if parent.state_callback:
-                            parent.state_callback(rec)
+                        parent._notify_state(rec)
 
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
@@ -303,8 +338,8 @@ class EmbeddedReceiverServer:
                             new_received = max(rec["received_bytes"], start_byte + len(chunk_bytes))
                             rec["received_bytes"] = new_received
                             
-                            # Track live speed
-                            speed = parent.speed_tracker.record_bytes(len(chunk_bytes))
+                            # Track live speed (per transfer_id, not server-global)
+                            speed = parent.speed_trackers.for_transfer(tid).record_bytes(len(chunk_bytes))
                             rec["speed_bytes_sec"] = speed
                             
                             is_complete = (new_received >= rec["total_size"])
@@ -324,13 +359,13 @@ class EmbeddedReceiverServer:
                                     sha_verified = (calculated_sha.lower() == rec["expected_sha256"].lower())
                                     rec["sha256_verified"] = sha_verified
                                 
-                                # Record into history database/JSON
+                                # Record into history database/JSON. Locked +
+                                # atomic, and never raises into the request handler.
                                 record_server_history_entry(rec, self.client_address)
                             else:
                                 rec["status"] = "in_progress"
 
-                            if parent.state_callback:
-                                parent.state_callback(rec)
+                            parent._notify_state(rec)
 
                             self.send_response(200)
                             self.send_header("Content-Type", "application/json")

@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Nexus Flow – German locale. -->
+    <string name="brand_tagline">SMARTE DATEIÜBERTRAGUNG</string>
+
+    <string name="nav_sender">Sender-Modus</string>
+    <string name="nav_receiver">Empfänger-Hub (P2P)</string>
+    <string name="nav_history">Übertragungsverlauf</string>
+    <string name="nav_settings">Einstellungen</string>
+    <string name="nav_connected_server">Verbundener Server</string>
+
+    <string name="card_data_flow">DATENFLUSS</string>
+    <string name="card_payload_source">QUELLDATEI</string>
+    <string name="card_target_endpoint">ZIELGERÄT (GERÄT B)</string>
+    <string name="card_nearby_devices">GERÄTE IN DER NÄHE (Zum Wählen tippen)</string>
+    <string name="recent_targets">LETZTE ZIELE</string>
+    <string name="card_transmission_log">ÜBERTRAGUNGSPROTOKOLL</string>
+
+    <string name="metric_volume">MENGE</string>
+    <string name="metric_rate">RATE</string>
+    <string name="metric_estimated">GESCHÄTZT</string>
+    <string name="metric_real_time">Echtzeit</string>
+    <string name="metric_time_left">Restzeit</string>
+
+    <string name="btn_start_transfer">ÜBERTRAGUNG STARTEN</string>
+    <string name="btn_pause">PAUSE</string>
+    <string name="btn_cancel">ABBRECHEN</string>
+    <string name="btn_resume">FORTSETZEN (%1$d%%)</string>
+    <string name="btn_reset">ZURÜCKSETZEN</string>
+    <string name="btn_new_transfer">NEUE ÜBERTRAGUNG</string>
+    <string name="btn_select_file">DATEI WÄHLEN</string>
+    <string name="btn_change_file">DATEI WECHSELN</string>
+    <string name="btn_ping_server">SERVER PRÜFEN</string>
+
+    <string name="label_device_ip">GERÄTE-IP</string>
+    <string name="label_port">PORT</string>
+
+    <string name="sha_verified">SHA-256 zu 100 % geprüft</string>
+    <string name="toast_hash_copied">Hash in die Zwischenablage kopiert</string>
+
+    <string name="status_idle">BEREIT</string>
+    <string name="status_connecting">VERBINDEN…</string>
+    <string name="status_ready">BEREIT</string>
+    <string name="status_transferring">STREAMING</string>
+    <string name="status_paused">PAUSE</string>
+    <string name="status_interrupted">UNTERBROCHEN</string>
+    <string name="status_completed">ABGESCHLOSSEN</string>
+    <string name="status_failed">FEHLGESCHLAGEN</string>
+    <string name="status_cancelled">ABGEBROCHEN</string>
+    <string name="status_verified">GEPRÜFT</string>
+
+    <string name="error_headline">Übertragung fehlgeschlagen</string>
+
+    <string name="receiver_enable">Empfang aktivieren</string>
+    <string name="receiver_no_files">Noch keine Dateien empfangen</string>
+
+    <string name="settings_title">Einstellungen</string>
+    <string name="settings_saved">Einstellungen gespeichert</string>
+
+    <string name="msg_notification_permission">Benachrichtigungsberechtigung für Hintergrundübertragungen erforderlich</string>
+    <string name="msg_receiver_started">Empfänger gestartet – sendet als „%1$s“</string>
+    <string name="msg_receiver_start_failed">Server konnte nicht gestartet werden (Port belegt?)</string>
+    <string name="msg_receiver_stopped">Empfangsserver gestoppt</string>
+    <string name="msg_ip_refreshed">IP aktualisiert: %1$s</string>
+    <string name="msg_files_saved_in">Dateien gespeichert unter Downloads/NexusFlow</string>
+    <string name="msg_pick_to_resume_history">Bitte „%1$s“ wählen, um die Übertragung fortzusetzen</string>
+    <string name="msg_select_file_to_resume">Bitte die Datei vom Gerät zum Fortsetzen wählen</string>
+    <string name="msg_testing">Wird getestet…</string>
+    <string name="msg_connected">Verbunden (%1$s)</string>
+    <string name="msg_connection_failed">Verbindung fehlgeschlagen</string>
+    <string name="msg_could_not_open_file">Datei konnte nicht geöffnet werden: %1$s</string>
+    <string name="msg_pairing_unrecognised">Dieser Kopplungscode konnte nicht gelesen werden</string>
+    <string name="msg_pairing_connected">Ziel gesetzt auf %1$s:%2$s</string>
+    <string name="msg_qr_scanned">Kopplungscode</string>
+    <string name="pairing_dialog_message">Kopplungscode des empfangenden Geräts einfügen oder eingeben (nexus://host:port).</string>
+
+    <string name="history_empty">Noch keine Übertragungen aufgezeichnet</string>
+    <string name="history_resume">Fortsetzen</string>
+</resources>

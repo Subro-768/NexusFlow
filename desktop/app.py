@@ -1,40 +1,73 @@
 import sys
 import os
 import io
-import time
 import socket
-import threading
 import json
 import subprocess
 import re
+import time
 import qrcode
-from PIL import Image, ImageQt
+import threading
+from PIL import Image
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot, QTimer, QSettings, QSize, QEvent
+from PyQt6.QtGui import (
+    QFont, QColor, QPixmap, QIcon, QGuiApplication, QFontMetrics,
+    QKeySequence, QShortcut, QCursor,
+)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QProgressBar, QStackedWidget,
-    QFrame, QLineEdit, QScrollArea, QGraphicsDropShadowEffect, QMessageBox,
-    QSizePolicy, QSpacerItem, QSpinBox, QCheckBox
+    QFrame, QLineEdit, QScrollArea, QMessageBox,
+    QSizePolicy, QSpinBox, QCheckBox
 )
-from PyQt6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QBrush, QPen, QCursor
 
-# Import transfer_client and embedded_server
+# Import transfer_client, embedded_server and nsd_helper (they sit next to this file)
 try:
-    from transfer_client import LinuxTransferClient
+    from transfer_client import (
+        LinuxTransferClient, TransferPaused, TransferCancelled, TransferError,
+        DEFAULT_CHUNK_SIZE,
+    )
     from embedded_server import EmbeddedReceiverServer
-    from nsd_helper import advertiser as nsd_advertiser, discovery as nsd_discovery, ZEROCONF_AVAILABLE
+    from nsd_helper import (
+        advertiser as nsd_advertiser, discovery as nsd_discovery,
+        ZEROCONF_AVAILABLE, ZEROCONF_UNAVAILABLE_REASON,
+    )
 except ImportError:
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from desktop.transfer_client import LinuxTransferClient
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from desktop.transfer_client import (
+        LinuxTransferClient, TransferPaused, TransferCancelled, TransferError,
+        DEFAULT_CHUNK_SIZE,
+    )
     from desktop.embedded_server import EmbeddedReceiverServer
     try:
-        from desktop.nsd_helper import advertiser as nsd_advertiser, discovery as nsd_discovery, ZEROCONF_AVAILABLE
+        from desktop.nsd_helper import (
+            advertiser as nsd_advertiser, discovery as nsd_discovery,
+            ZEROCONF_AVAILABLE, ZEROCONF_UNAVAILABLE_REASON,
+        )
     except ImportError:
         nsd_advertiser = None
         nsd_discovery = None
         ZEROCONF_AVAILABLE = False
+        ZEROCONF_UNAVAILABLE_REASON = "mDNS discovery module could not be imported."
+
+# Persistence layer: locked, cached, atomic (see desktop/storage.py).
+try:
+    from storage import (
+        load_history, save_history_entry, append_history_entry, clear_history,
+        load_recent_ips, save_recent_ip, load_device_name, save_device_name,
+        last_error as last_storage_error, subscribe_errors,
+    )
+except ImportError:
+    from desktop.storage import (
+        load_history, save_history_entry, append_history_entry, clear_history,
+        load_recent_ips, save_recent_ip, load_device_name, save_device_name,
+        last_error as last_storage_error, subscribe_errors,
+    )
+    HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_history.json")
 
 # ─── Palette ──────────────────────────────────────────────────────────────────
 SOLORA_BG               = "#090C10"
@@ -49,10 +82,205 @@ SOLORA_AMBER            = "#FFB703"
 SOLORA_ALERT_RED        = "#FF4D4D"
 SOLORA_TEXT_PRIMARY     = "#F8FAFC"
 SOLORA_TEXT_SECONDARY   = "#94A3B8"
-SOLORA_TEXT_MUTED       = "#64748B"
+# Was #64748B (3.35:1 on SURFACE_ELEVATED / 3.59:1 on SURFACE_CARD — below WCAG AA
+# for the 7.5–8.5pt meta text that uses it). Lightened one step to #7C8CA1, which
+# clears 4.5:1 on both surfaces (4.64 / 4.98).
+SOLORA_TEXT_MUTED       = "#7C8CA1"
+
+# ─── Type scale ───────────────────────────────────────────────────────────────
+# Named size steps. Qt QSS does support letter-spacing, so the 29 existing
+# letter-spacing usages are left untouched.
+FS_HERO      = "20pt"
+FS_TITLE     = "18pt"
+FS_XL        = "16pt"
+FS_DISPLAY   = "14pt"
+FS_LG        = "13pt"
+FS_HEADING   = "11pt"
+FS_SUBHEAD   = "10.5pt"
+FS_BODY      = "10pt"
+FS_BODY_SM   = "9.5pt"
+FS_SMALL     = "9pt"
+FS_META      = "8.5pt"
+FS_META_SM   = "8pt"
+FS_META_XS   = "7.5pt"
+FS_MICRO     = "7pt"
+
+FONT_STACK = "system-ui, 'Noto Sans', 'DejaVu Sans', -apple-system, sans-serif"
+FONT_MONO  = "monospace"
 
 DRAWER_WIDTH = 260
-HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_history.json")
+DEFAULT_WINDOW_SIZE = (1080, 720)
+MIN_WINDOW_SIZE = (860, 620)
+NEXUS_SCHEME = "nexus"
+PROGRESS_THROTTLE_HZ = 20.0
+
+
+def alpha(color: str, a: float) -> str:
+    """``alpha(SOLORA_CYAN, 0.3)`` -> ``'rgba(0, 212, 255, 0.3)'``.
+
+    Every translucent palette literal goes through here so a palette change can
+    never leave a hardcoded rgba() behind (the old code had 10 of them).
+    """
+    h = (color or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        raise ValueError(f"not a 6-digit hex colour: {color!r}")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r}, {g}, {b}, {a:g})"
+
+
+def mix(color_a: str, color_b: str, t: float) -> str:
+    """Blend two hex colours; ``t=0`` -> a, ``t=1`` -> b. Used for hover tints."""
+    def rgb(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    ar, ag, ab = rgb(color_a)
+    br, bg_, bb = rgb(color_b)
+    return "#%02X%02X%02X" % (
+        round(ar + (br - ar) * t),
+        round(ag + (bg_ - ag) * t),
+        round(ab + (bb - ab) * t),
+    )
+
+
+def relative_luminance(color: str) -> float:
+    h = (color or "").lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    chans = []
+    for i in (0, 2, 4):
+        c = int(h[i:i + 2], 16) / 255.0
+        chans.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+    r, g, b = chans
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG 2.1 contrast ratio between two hex colours."""
+    l1, l2 = relative_luminance(fg), relative_luminance(bg)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+# ─── QSS helpers (de-duplication of repeated inline stylesheet blocks) ─────────
+def badge_qss(bg: str, fg: str, size: str = FS_META_SM) -> str:
+    """Status badge pill. One place for the shape + padding of every badge."""
+    return (f"background: {bg}; color: {fg}; font-size: {size}; font-weight: bold; "
+            f"padding: 4px 10px; border-radius: 6px;")
+
+
+def rx_badge_qss(bg: str, fg: str) -> str:
+    """Receiver-side badge (same pill, 3px 8px padding, slightly smaller)."""
+    return (f"background: {bg}; color: {fg}; font-size: {FS_META_SM}; "
+            f"font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+
+
+def solid_button_qss(bg: str, fg: str = SOLORA_BG, radius: int = 10) -> str:
+    """Solid accent button WITH a matching :hover/:disabled so the global
+    ``QPushButton:hover { color: CYAN }`` rule cannot recolour its dark label
+    (that combination measured 1.53:1 on btn_start)."""
+    hover_bg = mix(bg, SOLORA_BG, 0.14)
+    return f"""
+        QPushButton {{
+            background-color: {bg};
+            color: {fg};
+            font-weight: bold;
+            border-radius: {radius}px;
+        }}
+        QPushButton:hover {{ background-color: {hover_bg}; color: {fg}; border: none; }}
+        QPushButton:pressed {{ background-color: {mix(bg, SOLORA_BG, 0.28)}; color: {fg}; }}
+        QPushButton:disabled {{ background-color: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_TEXT_MUTED}; }}
+    """
+
+
+def cancel_button_qss() -> str:
+    """Ghost/danger cancel button: keeps the red identity, adds a red :hover
+    instead of inheriting the global cyan-text hover (which would put
+    #00D4FF on #FF4D4D = 2.16:1)."""
+    return f"""
+        QPushButton {{
+            background-color: {SOLORA_ALERT_RED};
+            color: {SOLORA_BG};
+            font-weight: bold;
+            border-radius: 10px;
+        }}
+        QPushButton:hover {{
+            background-color: {mix(SOLORA_ALERT_RED, SOLORA_BG, 0.14)};
+            color: {SOLORA_BG};
+            border: none;
+        }}
+        QPushButton:pressed {{ background-color: {mix(SOLORA_ALERT_RED, SOLORA_BG, 0.28)}; }}
+        QPushButton:disabled {{
+            background-color: {SOLORA_SURFACE_ELEVATED};
+            color: {SOLORA_TEXT_MUTED};
+        }}
+    """
+
+
+def scrollbar_qss(handle: str = SOLORA_CYAN, bar_height: int = 6,
+                 handle_alpha: float = 0.5, hover_alpha: float = 0.8,
+                 include_add_page: bool = False) -> str:
+    """Horizontal thin scrollbar used by the nearby-devices and recent-host rows."""
+    extra = (f"""
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: none;
+            }}""" if include_add_page else "")
+    return f"""
+            QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollBar:horizontal {{
+                height: {bar_height}px;
+                background: {alpha('#FFFFFF', 0.03)};
+                border-radius: {bar_height // 2}px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {alpha(handle, handle_alpha)};
+                min-width: 24px;
+                border-radius: {bar_height // 2}px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: {alpha(handle, hover_alpha)};
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+                background: none;
+            }}{extra}
+        """
+
+
+PROGRESS_GRADIENT = ("qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                     f"stop:0 {SOLORA_CYAN}, stop:1 {SOLORA_ENERGY_GREEN})")
+
+
+def progress_qss(chunk_radius: int = 5) -> str:
+    """Themed progress bar. Shared by the sender and receiver bars so the
+    gradient cannot drift apart between the two definitions."""
+    return f"""
+            QProgressBar {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 7px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {PROGRESS_GRADIENT};
+                border-radius: {chunk_radius}px;
+            }}
+        """
+
+
+def elide(text: str, widget: QWidget, mode=Qt.TextElideMode.ElideRight) -> str:
+    """Elide ``text`` to the widget's current width, keeping the full text as tooltip."""
+    text = text or ""
+    try:
+        metrics = QFontMetrics(widget.font())
+        out = metrics.elidedText(text, mode, max(40, widget.width() - 4))
+    except Exception:
+        return text
+    widget.setToolTip(text if out != text else "")
+    return out
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def format_size(v):
@@ -109,85 +337,6 @@ def get_local_ips():
 
     return ips if ips else ["127.0.0.1"]
 
-def load_history():
-    try:
-        if os.path.exists(HISTORY_FILE):
-            with open(HISTORY_FILE) as f: return json.load(f)
-    except Exception: pass
-    return []
-
-def save_history_entry(entry):
-    h = load_history()
-    # Check if duplicate entry already at top
-    h = [x for x in h if not (x.get("transfer_id") == entry.get("transfer_id") and x.get("filename") == entry.get("filename"))]
-    h.insert(0, entry)
-    h = h[:100]
-    try:
-        with open(HISTORY_FILE, "w") as f: json.dump(h, f, indent=2)
-    except Exception: pass
-
-RECENT_IPS_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_recent_ips.json")
-
-def load_recent_ips():
-    try:
-        if os.path.exists(RECENT_IPS_FILE):
-            with open(RECENT_IPS_FILE) as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return [str(ip).strip() for ip in data if str(ip).strip()]
-    except Exception:
-        pass
-    # Fallback to scanning history for target_ips
-    try:
-        h = load_history()
-        ips = []
-        for x in h:
-            raw_ip = str(x.get("target_ip", "")).strip()
-            # Extract plain IP if it has text like "Received from 10.3.207.215"
-            match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", raw_ip)
-            clean_ip = match.group(0) if match else raw_ip
-            if clean_ip and clean_ip not in ips and clean_ip != "127.0.0.1":
-                ips.append(clean_ip)
-        return ips
-    except Exception:
-        return []
-
-def save_recent_ip(ip: str):
-    ip = ip.strip()
-    if not ip:
-        return
-    current = load_recent_ips()
-    if ip in current:
-        current.remove(ip)
-    current.insert(0, ip)
-    current = current[:20]
-    try:
-        with open(RECENT_IPS_FILE, "w") as f:
-            json.dump(current, f, indent=2)
-    except Exception:
-        pass
-
-
-DEVICE_NAME_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_device_name.txt")
-
-def load_device_name() -> str:
-    try:
-        if os.path.exists(DEVICE_NAME_FILE):
-            with open(DEVICE_NAME_FILE) as f:
-                name = f.read().strip()
-                if name:
-                    return name
-    except Exception:
-        pass
-    return socket.gethostname()
-
-def save_device_name(name: str):
-    try:
-        with open(DEVICE_NAME_FILE, "w") as f:
-            f.write(name.strip())
-    except Exception:
-        pass
-
 def open_file_or_dir(filepath: str):
     """Open file or folder with system default viewer."""
     try:
@@ -201,18 +350,230 @@ def open_file_or_dir(filepath: str):
         pass
 
 
+# ─── Settings (QSettings-backed, consumed by the client + server) ─────────────
+@dataclass
+class Settings:
+    """Persisted user settings. Read by LinuxTransferClient and the receiver."""
+    port: int = 8000
+    chunk_size_kb: int = DEFAULT_CHUNK_SIZE // 1024
+    verify_checksum: bool = True
+    timeout_sec: int = 30
+
+    @property
+    def chunk_size(self) -> int:
+        return max(64, int(self.chunk_size_kb)) * 1024
+
+    def validated(self) -> "Settings":
+        """Clamp values into ranges the controls advertise."""
+        self.port = 1 if not (1 <= self.port <= 65535) else int(self.port)
+        self.chunk_size_kb = min(4096, max(64, int(self.chunk_size_kb)))
+        self.timeout_sec = min(120, max(5, int(self.timeout_sec)))
+        self.verify_checksum = bool(self.verify_checksum)
+        return self
+
+
+SETTINGS_ORG = "NexusFlow"
+SETTINGS_APP = "NexusFlow Linux"
+
+
+def _settings_store() -> QSettings:
+    return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+
+SETTINGS = Settings()
+
+
+def load_settings() -> Settings:
+    """Read settings from QSettings, falling back to defaults on any problem."""
+    global SETTINGS
+    defaults = Settings()
+    try:
+        s = _settings_store()
+        cfg = Settings(
+            port=int(s.value("network/port", defaults.port)),
+            chunk_size_kb=int(s.value("transfer/chunk_kb", defaults.chunk_size_kb)),
+            verify_checksum=str(s.value("transfer/verify_sha256",
+                                        "true" if defaults.verify_checksum else "false")).lower()
+            in ("1", "true", "yes", "on"),
+            timeout_sec=int(s.value("network/timeout_sec", defaults.timeout_sec)),
+        )
+    except Exception as exc:
+        print(f"[Settings] falling back to defaults: {type(exc).__name__}: {exc}")
+        cfg = defaults
+    SETTINGS = cfg.validated()
+    return SETTINGS
+
+
+def save_settings(cfg: Settings) -> Settings:
+    """Persist settings to QSettings; returns the validated stored value."""
+    global SETTINGS
+    SETTINGS = cfg.validated()
+    try:
+        s = _settings_store()
+        s.setValue("network/port", SETTINGS.port)
+        s.setValue("transfer/chunk_kb", SETTINGS.chunk_size_kb)
+        s.setValue("transfer/verify_sha256", SETTINGS.verify_checksum)
+        s.setValue("network/timeout_sec", SETTINGS.timeout_sec)
+        s.sync()
+    except Exception as exc:
+        print(f"[Settings] could not persist: {type(exc).__name__}: {exc}")
+    return SETTINGS
+
+
+def make_client(base_url: str) -> LinuxTransferClient:
+    """Build a client that honours the persisted chunk size / timeout / verify."""
+    cfg = SETTINGS if isinstance(SETTINGS, Settings) else Settings()
+    return LinuxTransferClient(
+        base_url,
+        timeout=cfg.timeout_sec,
+        chunk_size=cfg.chunk_size,
+        verify_checksum=cfg.verify_checksum,
+    )
+
+
+# ─── nexus:// pairing scheme (encoded in the receiver QR, parsed on the sender) ─
+@dataclass
+class PairTarget:
+    """Parsed ``nexus://`` payload: a host, a port and an optional display name."""
+    host: str = ""
+    port: int = 8000
+    name: str = ""
+    raw: str = ""
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(self.host)
+
+
+def build_pairing_url(host: str, port: int, name: str = "") -> str:
+    """``nexus://receive/<name>?host=<ip>&port=<n>`` — what the QR encodes."""
+    from urllib.parse import quote
+    url = f"{NEXUS_SCHEME}://receive/{quote(name or host, safe='')}"
+    params = []
+    if host:
+        params.append(f"host={quote(host, safe='')}")
+    if port:
+        params.append(f"port={int(port)}")
+    if params:
+        url += "?" + "&".join(params)
+    return url
+
+
+def parse_pairing_url(text: str) -> PairTarget:
+    """Parse a ``nexus://`` URL (or a bare ``http://host:port`` endpoint).
+
+    Returns a :class:`PairTarget`; ``is_valid`` is False for anything that does
+    not yield a host. Never raises — untrusted QR content must not crash the app.
+    """
+    from urllib.parse import parse_qs, unquote, urlparse
+    text = (text or "").strip()
+    if not text:
+        return PairTarget()
+    if text.lower().startswith(f"{NEXUS_SCHEME}://"):
+        try:
+            parsed = urlparse(text)
+        except ValueError:
+            return PairTarget(raw=text)
+        path = parsed.path or ""
+        name = unquote(path.strip("/").split("/")[-1]) if path.strip("/") else ""
+        qs = parse_qs(parsed.query or "")
+        host = (qs.get("host") or [""])[0].strip()
+        port_raw = (qs.get("port") or [""])[0].strip()
+        if not host:
+            # Bare nexus://receive/<ip> form — the host *is* the path segment.
+            for candidate in (name, parsed.netloc):
+                if candidate and _looks_like_host(candidate):
+                    host = candidate
+                    break
+            name = name if name != host else ""
+        port = 8000
+        if port_raw.isdigit():
+            port = int(port_raw)
+        return PairTarget(host=host, port=port, name=name, raw=text)
+    if text.lower().startswith(("http://", "https://")):
+        try:
+            parsed = urlparse(text)
+        except ValueError:
+            return PairTarget(raw=text)
+        port = parsed.port or (443 if parsed.scheme == "https" else 8000)
+        return PairTarget(host=(parsed.hostname or ""), port=port, name="", raw=text)
+    # Bare host or host:port
+    if _looks_like_host(text):
+        host, _, port_raw = text.rpartition(":")
+        if not host:
+            host, port_raw = text, ""
+        port = int(port_raw) if port_raw.isdigit() else 8000
+        return PairTarget(host=host, port=port, name="", raw=text)
+    return PairTarget(raw=text)
+
+
+def _looks_like_host(candidate: str) -> bool:
+    """True for an IPv4 literal or a DNS-ish hostname."""
+    if not candidate:
+        return False
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", candidate):
+        return all(0 <= int(o) <= 255 for o in candidate.split("."))
+    if re.fullmatch(r"(?i)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+                    r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+", candidate):
+        return "." in candidate
+    return False
+
+
+# ─── Path of an optional PNG logo, robust when the asset is not bundled ───────
+LOGO_CANDIDATES = (
+    os.path.join("desktop", "assets", "nexusflow.png"),
+    os.path.join("desktop", "assets", "ic_nexus_flow.png"),
+    os.path.join("..", "android", "app", "src", "main", "res", "drawable", "ic_nexus_flow.png"),
+)
+
+LOGO_GLYPH = "◈"
+
+
+def find_logo_path() -> str:
+    """First existing bundled logo, or '' when none is available.
+
+    The PyInstaller bundle only ships ``desktop/`` (see NexusFlow.spec), so the
+    previous ``../android/...`` reference silently resolved to nothing in the
+    shipped build. This also looks in ``sys._MEIPASS`` and tolerates a missing
+    file by returning '' so the caller can fall back to the glyph.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    roots = [base, getattr(sys, "_MEIPASS", "") or ""]
+    for root in roots:
+        if not root:
+            continue
+        for rel in LOGO_CANDIDATES:
+            path = os.path.normpath(os.path.join(root, rel))
+            if os.path.isfile(path):
+                return path
+    return ""
+
+
 # ─── Transfer Worker ──────────────────────────────────────────────────────────
 class TransferWorker(QThread):
+    """Runs one transfer on its own thread and reports a *distinguishable*
+    terminal outcome: completed / paused / cancelled / failed.
+
+    Pause and cancel used to raise a bare ``Exception``, land in ``error_signal``
+    and paint the UI as INTERRUPTED. Now :class:`TransferPaused` /
+    :class:`TransferCancelled` get their own signals so the badge stays honest.
+    """
+
     progress_signal  = pyqtSignal(int, int, float, float)
     status_signal    = pyqtSignal(str, str)
     completed_signal = pyqtSignal(dict)
     error_signal     = pyqtSignal(str)
+    paused_signal    = pyqtSignal()
+    cancelled_signal = pyqtSignal()
 
     def __init__(self, client, filepath, existing_transfer_id=None):
         super().__init__()
         self.client = client
         self.filepath = filepath
         self.existing_transfer_id = existing_transfer_id
+        self.last_progress = (0, 0, 0.0, 0.0)
+        #: Latest values, for a final flush when the thread is torn down early.
+        self.result: dict = {}
 
     def run(self):
         try:
@@ -230,13 +591,68 @@ class TransferWorker(QThread):
                 sess = self.client.create_transfer(self.filepath, checksum=checksum)
                 transfer_id = sess["transfer_id"]
             self.status_signal.emit("Transferring", f"Streaming from byte {start_offset}...")
+
+            def _progress(curr, total, spd, eta):
+                self.last_progress = (curr, total, spd, eta)
+                self.progress_signal.emit(curr, total, spd, eta)
+
             res = self.client.send_file(
-                filepath=self.filepath, transfer_id=transfer_id, start_offset=start_offset,
-                progress_callback=lambda c,t,s,e: self.progress_signal.emit(c,t,s,e)
+                filepath=self.filepath, transfer_id=transfer_id,
+                start_offset=start_offset, progress_callback=_progress,
             )
+            self.result = res if isinstance(res, dict) else {}
             self.completed_signal.emit(res)
+        except TransferPaused:
+            self.paused_signal.emit()
+        except TransferCancelled:
+            self.cancelled_signal.emit()
         except Exception as e:
-            self.error_signal.emit(str(e))
+            self.error_signal.emit(str(e) or type(e).__name__)
+
+    def request_transfer_interrupt(self, cancel: bool = False):
+        """Ask the worker to stop. ``cancel=True`` also flags the client."""
+        self.requestInterruption()
+        try:
+            if cancel:
+                self.client.cancel()
+            else:
+                self.client.interrupt()
+        except Exception as exc:
+            print(f"[TransferWorker] interrupt failed: {type(exc).__name__}: {exc}")
+
+
+class ConnectionTester(QThread):
+    """Item 2: ``GET /health`` on a worker thread so the window never freezes.
+
+    The old implementation called ``requests.get(timeout=4)`` inline plus a
+    re-entrant ``QApplication.processEvents()`` from the click handler, so
+    clicking any nearby device or recent IP stalled the UI for up to 4 seconds.
+    """
+
+    finished_probe = pyqtSignal(bool, str, str)  # (ok, message, detail)
+
+    def __init__(self, base_url: str, parent=None):
+        super().__init__(parent)
+        self.base_url = base_url
+        self.client = make_client(base_url)
+        self._seq = 0
+
+    def run(self):
+        self._seq += 1
+        seq = self._seq
+        try:
+            res = self.client.test_connection()
+            if seq == self._seq:  # superseded by a newer probe
+                return
+            service = (res or {}).get("service", "ok")
+            self.finished_probe.emit(True, f"● Connected ({service})", str(service))
+        except Exception as e:
+            if seq != self._seq:
+                return
+            # Stop discarding the reason: wrong port / wrong IP / firewall /
+            # receiver-not-enabled are otherwise indistinguishable.
+            self.finished_probe.emit(False, "● Unreachable",
+                                     f"{type(e).__name__}: {e}")
 
 
 # ─── Nav Drawer ───────────────────────────────────────────────────────────────
@@ -349,23 +765,107 @@ class NavDrawer(QWidget):
         self._on_nav(idx)
 
 
+# ─── Thread bridge ────────────────────────────────────────────────────────────
+class WorkerBridge(QObject):
+    """Marshals non-GUI-thread callbacks onto the GUI thread.
+
+    Two paths used to call widget methods straight from a background thread:
+    ``EmbeddedReceiverServer.state_callback`` (an http.server ThreadingMixIn
+    request thread, calling setValue/setText/setStyleSheet/deleteLater) and the
+    zeroconf ``on_change`` callback (the mDNS listener thread). Both now emit a
+    Qt signal connected with ``Qt.QueuedConnection``, which guarantees the slot
+    runs on the thread that owns the receiver — the GUI thread.
+    """
+
+    server_state = pyqtSignal(dict)
+    peers_changed = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self._server_threads: set = set()
+
+    # ── Called from the server request thread ──
+    def on_server_state(self, rec: dict):
+        """Fire-and-forget from an HTTP request thread; Qt queues the delivery."""
+        self.server_state.emit(dict(rec or {}))
+
+    def is_server_thread(self) -> bool:
+        return threading.current_thread() in self._server_threads
+
+    def register_server_thread(self, thread) -> None:
+        with self._lock:
+            self._server_threads.add(thread)
+
+    def unregister_server_thread(self, thread) -> None:
+        with self._lock:
+            self._server_threads.discard(thread)
+
+    # ── Called from the zeroconf listener thread ──
+    def on_peers_changed(self, peers):
+        self.peers_changed.emit(list(peers or []))
+
+
 # ─── Sender Screen ────────────────────────────────────────────────────────────
 class SenderScreen(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, bridge: WorkerBridge = None):
         super().__init__(parent)
         self.selected_file = None
         self.active_worker = None
         self.active_client = None
         self.active_transfer_id = None
+        self.active_file = None
+        self.conn_tester: ConnectionTester | None = None
+        self.bridge = bridge
+        self.discovery_ok = False
+        self.discovery_error = None
+        self._peer_signature = None
+        self._last_progress_emit = 0.0
+        self._progress_min_interval = 1.0 / PROGRESS_THROTTLE_HZ
         self._build()
 
-        # Start NSD discovery and refresh UI every 2 seconds
-        if nsd_discovery:
-            own_ips = get_local_ips()
-            nsd_discovery.start(own_ips=own_ips, on_change=lambda peers: self.refresh_nearby_devices_ui())
+        # Start NSD discovery and refresh the peer panel every 2s. The callback
+        # runs on the zeroconf listener thread, so it is routed through the
+        # bridge (QueuedConnection) instead of touching widgets directly.
+        if bridge is not None:
+            bridge.peers_changed.connect(self.refresh_nearby_devices_ui,
+                                        Qt.ConnectionType.QueuedConnection)
         self._discovery_timer = QTimer(self)
         self._discovery_timer.timeout.connect(self.refresh_nearby_devices_ui)
         self._discovery_timer.start(2000)
+        self.start_discovery()
+
+    # ── Discovery lifecycle ──────────────────────────────────────────────────
+    def start_discovery(self):
+        """Start mDNS discovery, surfacing failure as a distinct UI state."""
+        if nsd_discovery is None:
+            self.discovery_ok = False
+            self.discovery_error = "mDNS discovery module unavailable."
+        else:
+            try:
+                own_ips = get_local_ips()
+                on_change = self.bridge.on_peers_changed if self.bridge else None
+                self.discovery_ok = bool(nsd_discovery.start(own_ips=own_ips, on_change=on_change))
+                self.discovery_error = None if self.discovery_ok else (
+                    getattr(nsd_discovery, "last_error", None) or ZEROCONF_UNAVAILABLE_REASON
+                )
+            except Exception as exc:
+                self.discovery_ok = False
+                self.discovery_error = f"{type(exc).__name__}: {exc}"
+        self._peer_signature = None
+        self.refresh_nearby_devices_ui()
+
+    def set_page_visible(self, visible: bool):
+        """Item 13/26: stop the 2s poll when the Sender page is off-screen."""
+        if visible:
+            self.start_discovery()
+            self._discovery_timer.start(2000)
+        else:
+            self._discovery_timer.stop()
+
+    @staticmethod
+    def _peer_hash(peers) -> str:
+        return "|".join(sorted(f"{p.name}@{p.host}:{p.port}" for p in peers))
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -373,7 +873,7 @@ class SenderScreen(QWidget):
         layout.setSpacing(16)
 
         title = QLabel("SENDER MODE")
-        title.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: 11pt; font-weight: bold; letter-spacing: 2px;")
+        title.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: {FS_HEADING}; font-weight: bold; letter-spacing: 2px;")
         layout.addWidget(title)
 
         # Connection card
@@ -396,8 +896,8 @@ class SenderScreen(QWidget):
                 border: 1px solid {SOLORA_BORDER};
                 border-radius: 8px;
                 padding: 6px 10px;
-                font-family: monospace;
-                font-size: 10pt;
+                font-family: {FONT_MONO};
+                font-size: {FS_BODY};
             }}
             QPushButton {{
                 background-color: {SOLORA_SURFACE_ELEVATED};
@@ -406,7 +906,7 @@ class SenderScreen(QWidget):
                 border-radius: 8px;
                 padding: 6px 14px;
                 font-weight: bold;
-                font-size: 9pt;
+                font-size: {FS_SMALL};
             }}
             QPushButton:hover {{
                 border-color: {SOLORA_CYAN};
@@ -420,7 +920,7 @@ class SenderScreen(QWidget):
         nearby_frame.setStyleSheet(f"""
             QFrame {{
                 background-color: {SOLORA_SURFACE_ELEVATED};
-                border: 1px solid rgba(0, 212, 255, 0.3);
+                border: 1px solid {alpha(SOLORA_CYAN, 0.3)};
                 border-radius: 10px;
             }}
             QLabel {{ background: transparent; }}
@@ -431,9 +931,10 @@ class SenderScreen(QWidget):
 
         nearby_title_row = QHBoxLayout()
         lbl_nearby = QLabel("⬡  NEARBY DEVICES")
-        lbl_nearby.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; letter-spacing: 1px;")
+        lbl_nearby.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: {FS_SMALL}; letter-spacing: 1px;")
         self.lbl_scanning = QLabel("● Scanning...")
-        self.lbl_scanning.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt;")
+        self.lbl_scanning.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM};")
+        self.lbl_scanning.setAccessibleName("Discovery status")
         nearby_title_row.addWidget(lbl_nearby)
         nearby_title_row.addStretch()
         nearby_title_row.addWidget(self.lbl_scanning)
@@ -442,18 +943,24 @@ class SenderScreen(QWidget):
         btn_refresh_nearby = QPushButton("⟳")
         btn_refresh_nearby.setFixedSize(28, 28)
         btn_refresh_nearby.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        btn_refresh_nearby.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_CYAN}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: 8pt;")
+        btn_refresh_nearby.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_CYAN}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: {FS_META_SM};")
         btn_refresh_nearby.setToolTip("Refresh nearby devices")
+        btn_refresh_nearby.setAccessibleName("Refresh nearby devices")
         btn_refresh_nearby.clicked.connect(self.refresh_nearby_devices_ui)
         nearby_title_row.addWidget(btn_refresh_nearby)
 
-        # QR scanner button (for quick pairing)
-        btn_qr_scan = QPushButton("📷")
+        # Pairing-code paste button. The old "📷" button opened a dialog telling
+        # the user to point a camera at the screen — with no camera access
+        # anywhere in the app. It now pastes a nexus:// / http:// pairing code,
+        # which is the same information the receiver's QR encodes and which
+        # parse_pairing_url() actually understands.
+        btn_qr_scan = QPushButton("🔗")
         btn_qr_scan.setFixedSize(28, 28)
         btn_qr_scan.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        btn_qr_scan.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_NEON_LIME}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: 8pt;")
-        btn_qr_scan.setToolTip("Scan QR code from receiver device")
-        btn_qr_scan.clicked.connect(self.scan_qr_from_receiver)
+        btn_qr_scan.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_NEON_LIME}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: {FS_META_SM};")
+        btn_qr_scan.setToolTip("Paste a pairing code from the receiver's QR screen")
+        btn_qr_scan.setAccessibleName("Paste pairing code")
+        btn_qr_scan.clicked.connect(self.pair_from_code)
         nearby_title_row.addWidget(btn_qr_scan)
         nf_layout.addLayout(nearby_title_row)
 
@@ -464,43 +971,37 @@ class SenderScreen(QWidget):
         self.nearby_devices_layout.setSpacing(8)
 
         nearby_scroll = QScrollArea()
-        nearby_scroll.setFixedHeight(64)
+        # Item 11: minimum height + expanding policy instead of a rigid 64px, so
+        # peer cards can grow/wrap; identical height at the default window size.
+        nearby_scroll.setMinimumHeight(64)
+        nearby_scroll.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Fixed)
         nearby_scroll.setWidgetResizable(True)
         nearby_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         nearby_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        nearby_scroll.setStyleSheet(f"""
-            QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
-                background: transparent;
-                border: none;
-            }}
-            QScrollBar:horizontal {{
-                height: 6px;
-                background: rgba(255,255,255,0.03);
-                border-radius: 3px;
-            }}
-            QScrollBar::handle:horizontal {{
-                background: rgba(0,212,255,0.5);
-                min-width: 24px;
-                border-radius: 3px;
-            }}
-            QScrollBar::handle:horizontal:hover {{
-                background: rgba(0,212,255,0.8);
-            }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-                width: 0px; background: none;
-            }}
-        """)
+        nearby_scroll.setStyleSheet(scrollbar_qss(SOLORA_CYAN, bar_height=6,
+                                                  handle_alpha=0.5, hover_alpha=0.8))
         nearby_scroll.setWidget(self.nearby_devices_container)
         nf_layout.addWidget(nearby_scroll)
         cl.addWidget(nearby_frame)
 
         # Manual entry row (collapsed/hidden by default - nearby devices is primary)
         # Kept for edge cases but not prominent
-        manual_row_label = QLabel("▼  MANUAL IP ENTRY (fallback)")
-        manual_row_label.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; letter-spacing: 1px;")
-        manual_row_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        manual_row_label.mousePressEvent = lambda e: self._toggle_manual_entry()
-        cl.addWidget(manual_row_label)
+        # Item 22: the label is now a real focusable button stored on self, so
+        # _toggle_manual_entry no longer scans every QLabel for a magic substring.
+        self.manual_row_label = QPushButton("▼  MANUAL IP ENTRY (fallback)")
+        self.manual_row_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.manual_row_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.manual_row_label.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; text-align: left;"
+            f" color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-weight: bold;"
+            f" letter-spacing: 1px; padding: 0; }}"
+            f"QPushButton:hover {{ color: {SOLORA_CYAN}; background: transparent; }}"
+            f"QPushButton:focus {{ color: {SOLORA_CYAN}; }}")
+        self.manual_row_label.setAccessibleName("Toggle manual IP entry")
+        self.manual_row_label.setToolTip("Show or hide manual host/port entry")
+        self.manual_row_label.clicked.connect(self._toggle_manual_entry)
+        cl.addWidget(self.manual_row_label)
 
         self.manual_entry_widget = QWidget()
         self.manual_entry_widget.setVisible(False)
@@ -509,19 +1010,31 @@ class SenderScreen(QWidget):
         manual_layout.setSpacing(8)
 
         top_conn = QHBoxLayout(); top_conn.setSpacing(10)
-        lbl_t = QLabel("DEVICE NAME:")
-        lbl_t.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; background: transparent;")
-        # Show discovered device name (primary selection via nearby devices panel)
+        # Item 14: this field holds an IP / hostname, never a device name
+        # (select_recent_ip writes an IP, select_peer writes peer.host, and
+        # load_recent_ips regex-extracts IPs). The old "DEVICE NAME:" label was
+        # actively misleading. Widget texts are otherwise unchanged.
+        lbl_t = QLabel("TARGET HOST/IP:")
+        lbl_t.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: {FS_SMALL}; background: transparent;")
+        # Show discovered device host (primary selection via nearby devices panel)
         self.txt_peer_name = QLineEdit(""); self.txt_peer_name.setFixedWidth(150)
+        self.txt_peer_name.setPlaceholderText("e.g. 192.168.1.42")
+        self.txt_peer_name.setAccessibleName("Target host or IP address")
+        self.txt_peer_name.setToolTip("IPv4 address or hostname of the receiving device")
         lbl_p = QLabel("PORT:")
-        lbl_p.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-weight: bold; font-size: 9pt; background: transparent;")
-        self.txt_port = QLineEdit("8000"); self.txt_port.setFixedWidth(70)
+        lbl_p.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-weight: bold; font-size: {FS_SMALL}; background: transparent;")
+        self.txt_port = QLineEdit(str(SETTINGS.port)); self.txt_port.setFixedWidth(70)
+        self.txt_port.setAccessibleName("Target port")
+        self.txt_port.setToolTip("TCP port the receiver is listening on")
         self.btn_test = QPushButton("TEST CONNECTION"); self.btn_test.clicked.connect(self.test_connection)
+        self.btn_test.setAccessibleName("Test connection to target")
         self.lbl_conn = QLabel("● Ready")
         self.lbl_conn.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-weight: bold; background: transparent;")
+        self.lbl_conn.setAccessibleName("Connection status")
+        self.lbl_conn.setWordWrap(True)
         for w in [lbl_t, self.txt_peer_name, lbl_p, self.txt_port, self.btn_test]:
             top_conn.addWidget(w)
-        top_conn.addSpacing(10); top_conn.addWidget(self.lbl_conn); top_conn.addStretch()
+        top_conn.addSpacing(10); top_conn.addWidget(self.lbl_conn, 1); top_conn.addStretch()
         manual_layout.addLayout(top_conn)
 
         # Faded Recent IP History Row / Scrollbar area
@@ -532,42 +1045,22 @@ class SenderScreen(QWidget):
         self.recent_ips_layout.setSpacing(6)
 
         recent_scroll = QScrollArea()
-        recent_scroll.setFixedHeight(36)
+        # Item 11: minimum instead of a rigid 36px, so a longer recent list or a
+        # taller theme does not clip; same rendered height by default.
+        recent_scroll.setMinimumHeight(36)
+        recent_scroll.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                    QSizePolicy.Policy.Fixed)
         recent_scroll.setWidgetResizable(True)
         recent_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         recent_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        recent_scroll.setStyleSheet(f"""
-            QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
-                background: transparent;
-                border: none;
-            }}
-            QScrollBar:horizontal {{
-                height: 4px;
-                background: rgba(255, 255, 255, 0.03);
-                margin: 0px;
-                border-radius: 2px;
-            }}
-            QScrollBar::handle:horizontal {{
-                background: rgba(100, 116, 139, 0.35);
-                min-width: 24px;
-                border-radius: 2px;
-            }}
-            QScrollBar::handle:horizontal:hover {{
-                background: rgba(0, 212, 255, 0.6);
-            }}
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
-                width: 0px;
-                background: none;
-            }}
-            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
-                background: none;
-            }}
-        """)
+        recent_scroll.setStyleSheet(scrollbar_qss(SOLORA_TEXT_MUTED, bar_height=4,
+                                                  handle_alpha=0.35, hover_alpha=0.6,
+                                                  include_add_page=True))
         recent_scroll.setWidget(self.recent_ips_container)
 
         recent_header = QHBoxLayout(); recent_header.setSpacing(8)
         lbl_recent_tag = QLabel("RECENT:")
-        lbl_recent_tag.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; letter-spacing: 1px; background: transparent;")
+        lbl_recent_tag.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-weight: bold; letter-spacing: 1px; background: transparent;")
         recent_header.addWidget(lbl_recent_tag)
         recent_header.addWidget(recent_scroll, 1)
         manual_layout.addLayout(recent_header)
@@ -583,10 +1076,12 @@ class SenderScreen(QWidget):
         pl = QVBoxLayout(pc); pl.setContentsMargins(20,20,20,20); pl.setSpacing(12)
         top = QHBoxLayout()
         self.lbl_file = QLabel("NO FILE SELECTED")
-        self.lbl_file.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: 14pt; font-weight: bold;")
+        self.lbl_file.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: {FS_DISPLAY}; font-weight: bold;")
+        self.lbl_file.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl_badge = QLabel("STANDBY")
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_TEXT_SECONDARY}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
-        top.addWidget(self.lbl_file); top.addStretch(); top.addWidget(self.lbl_badge)
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_SURFACE_ELEVATED, SOLORA_TEXT_SECONDARY))
+        self.lbl_badge.setAccessibleName("Transfer status")
+        top.addWidget(self.lbl_file, 1); top.addStretch(); top.addWidget(self.lbl_badge)
         pl.addLayout(top)
         self.prog_bar = QProgressBar()
         self.prog_bar.setRange(0,100); self.prog_bar.setValue(0)
@@ -594,11 +1089,11 @@ class SenderScreen(QWidget):
         pl.addWidget(self.prog_bar)
         mr = QHBoxLayout()
         self.lbl_vol   = QLabel("0 B / 0 B (0%)")
-        self.lbl_vol.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: monospace; font-size: 10pt;")
+        self.lbl_vol.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: {FONT_MONO}; font-size: {FS_BODY};")
         self.lbl_speed = QLabel("0 KB/s")
-        self.lbl_speed.setStyleSheet(f"color: {SOLORA_NEON_LIME}; font-weight: bold; font-family: monospace; font-size: 10pt;")
+        self.lbl_speed.setStyleSheet(f"color: {SOLORA_NEON_LIME}; font-weight: bold; font-family: {FONT_MONO}; font-size: {FS_BODY};")
         self.lbl_eta   = QLabel("ETA: --")
-        self.lbl_eta.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: monospace; font-size: 10pt;")
+        self.lbl_eta.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: {FONT_MONO}; font-size: {FS_BODY};")
         mr.addWidget(self.lbl_vol); mr.addStretch()
         mr.addWidget(self.lbl_speed); mr.addSpacing(16); mr.addWidget(self.lbl_eta)
         pl.addLayout(mr)
@@ -607,8 +1102,8 @@ class SenderScreen(QWidget):
         log_box = QFrame()
         log_box.setStyleSheet(f"""
             QFrame {{
-                background-color: rgba(26, 34, 50, 0.7);
-                border: 1px solid rgba(0, 212, 255, 0.25);
+                background-color: {alpha(SOLORA_SURFACE_ELEVATED, 0.7)};
+                border: 1px solid {alpha(SOLORA_CYAN, 0.25)};
                 border-radius: 8px;
             }}
         """)
@@ -617,9 +1112,14 @@ class SenderScreen(QWidget):
         lbl_box_layout.setSpacing(10)
 
         self.lbl_log_dot = QLabel("●")
-        self.lbl_log_dot.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 11pt; background: transparent;")
+        self.lbl_log_dot.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: {FS_HEADING}; background: transparent;")
         self.lbl_log = QLabel("Ready to initiate high-speed data transfer.")
-        self.lbl_log.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: 9.5pt; font-weight: 600; letter-spacing: 0.5px; background: transparent;")
+        self.lbl_log.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: {FS_BODY_SM}; font-weight: 600; letter-spacing: 0.5px; background: transparent;")
+        # Item 23: long SHA / error strings were pushed into a fixed-height box and
+        # clipped. Wrap instead, and keep the full text as a tooltip.
+        self.lbl_log.setWordWrap(True)
+        self.lbl_log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.lbl_log.setAccessibleName("Transfer log message")
         lbl_box_layout.addWidget(self.lbl_log_dot)
         lbl_box_layout.addWidget(self.lbl_log, 1)
         pl.addWidget(log_box)
@@ -628,14 +1128,22 @@ class SenderScreen(QWidget):
         # Buttons
         br = QHBoxLayout()
         self.btn_pick = QPushButton("SELECT FILE FROM DISK"); self.btn_pick.setFixedHeight(46)
+        self.btn_pick.setAccessibleName("Select file from disk")
+        self.btn_pick.setToolTip("Choose a file to send (Ctrl+O) — or drag & drop it onto this window")
         self.btn_pick.clicked.connect(self.pick_file)
         self.btn_start = QPushButton("▶  START TRANSFER"); self.btn_start.setFixedHeight(46)
         self.btn_start.setEnabled(False)
-        self.btn_start.setStyleSheet(f"background-color: {SOLORA_NEON_LIME}; color: {SOLORA_BG}; font-weight: bold; border-radius: 10px;")
+        # Item 4: a matching :hover/:disabled so the global
+        # QPushButton:hover{color:CYAN} cannot recolour the dark label
+        # (measured #00D4FF on #D4FF00 = 1.53:1).
+        self.btn_start.setStyleSheet(solid_button_qss(SOLORA_NEON_LIME, SOLORA_BG, 10))
+        self.btn_start.setAccessibleName("Start or resume transfer")
         self.btn_start.clicked.connect(self.start_or_resume)
         self.btn_pause = QPushButton("⏸  PAUSE"); self.btn_pause.setFixedHeight(46); self.btn_pause.setEnabled(False)
+        self.btn_pause.setAccessibleName("Pause transfer")
         self.btn_pause.clicked.connect(self.pause_transfer)
         self.btn_cancel = QPushButton("✖  CANCEL"); self.btn_cancel.setFixedHeight(46); self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setAccessibleName("Cancel transfer (Esc)")
         self.btn_cancel.clicked.connect(self.cancel_transfer)
         br.addWidget(self.btn_pick, 2); br.addWidget(self.btn_start, 3)
         br.addWidget(self.btn_pause, 1); br.addWidget(self.btn_cancel, 1)
@@ -643,27 +1151,47 @@ class SenderScreen(QWidget):
         layout.addStretch()
 
     def _toggle_manual_entry(self):
-        """Toggle visibility of manual IP entry section."""
+        """Toggle visibility of manual IP entry section (item 22: direct ref)."""
         is_visible = self.manual_entry_widget.isVisible()
         self.manual_entry_widget.setVisible(not is_visible)
-        label_text = "▲  MANUAL IP ENTRY (fallback)" if not is_visible else "▼  MANUAL IP ENTRY (fallback)"
-        # Update the label text
-        for child in self.findChildren(QLabel):
-            if "MANUAL IP ENTRY" in child.text() or "MANUAL ENTRY" in child.text():
-                child.setText(label_text)
-                break
-
-    def scan_qr_from_receiver(self):
-        """Launch camera/QR scanner to read receiver device pairing code."""
-        # On Linux desktop: prompt user to use phone/camera to scan receiver QR
-        # The receiver broadcasts its device name via NSD; scanning QR connects instantly
-        QMessageBox.information(
-            self, "QR Pairing",
-            "Point your camera at the receiver device's pairing screen.\n"
-            "When the device name appears in 'Nearby Devices', tap it to connect."
+        self.manual_row_label.setText(
+            "▲  MANUAL IP ENTRY (fallback)" if not is_visible
+            else "▼  MANUAL IP ENTRY (fallback)"
         )
-        # Trigger nearby device refresh after prompt
-        self.refresh_nearby_devices_ui()
+
+    def pair_from_code(self):
+        """Item 15: accept a receiver pairing code (what the QR encodes).
+
+        Replaces the old camera affordance, which promised a scan that the app
+        never performed.
+        """
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self, "Pair with Receiver",
+            "Paste the pairing code from the receiver's QR screen\n"
+            "(nexus://receive/... or http://ip:port):"
+        )
+        if not ok or not text.strip():
+            return
+        self.apply_pairing_code(text)
+
+    def apply_pairing_code(self, text: str) -> bool:
+        """Parse a pairing code and prefill host/port, then test the link."""
+        target = parse_pairing_url(text)
+        if not target.is_valid:
+            QMessageBox.warning(
+                self, "Pairing code",
+                f"Could not read a host from:\n\n{text}\n\n"
+                "Expected a nexus://receive/<name>?host=<ip>&port=<n> code, "
+                "an http://ip:port endpoint, or a bare IP address.",
+            )
+            return False
+        self.txt_peer_name.setText(target.host)
+        self.txt_port.setText(str(target.port))
+        label = target.name or target.host
+        self.lbl_log.setText(f"Paired with '{label}' at {target.host}:{target.port}.")
+        self.test_connection()
+        return True
 
     def refresh_recent_ips_ui(self):
         while self.recent_ips_layout.count() > 0:
@@ -674,13 +1202,15 @@ class SenderScreen(QWidget):
         recent_ips = load_recent_ips()
         if not recent_ips:
             lbl_none = QLabel("No saved target IPs yet")
-            lbl_none.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-style: italic;")
+            lbl_none.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-style: italic;")
             self.recent_ips_layout.addWidget(lbl_none)
         else:
             for ip in recent_ips:
                 btn_ip = QPushButton(ip)
                 btn_ip.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                 btn_ip.setFixedHeight(26)
+                btn_ip.setAccessibleName(f"Reconnect to {ip}")
+                btn_ip.setToolTip(f"Test the connection to {ip}")
                 btn_ip.setStyleSheet(f"""
                     QPushButton {{
                         background-color: {SOLORA_SURFACE_ELEVATED};
@@ -688,8 +1218,8 @@ class SenderScreen(QWidget):
                         border: 1px solid {SOLORA_BORDER};
                         border-radius: 6px;
                         padding: 2px 10px;
-                        font-family: monospace;
-                        font-size: 8.5pt;
+                        font-family: {FONT_MONO};
+                        font-size: {FS_META};
                         font-weight: bold;
                     }}
                     QPushButton:hover {{
@@ -713,63 +1243,112 @@ class SenderScreen(QWidget):
         self.txt_port.setText(str(port))
         self.test_connection()
 
-    def refresh_nearby_devices_ui(self):
-        """Refresh the nearby devices panel from current NSD discovery results."""
+    def refresh_nearby_devices_ui(self, _peers=None):
+        """Rebuild the nearby-devices panel from current discovery results.
+
+        Item 13: only rebuild when the peer set actually changed, so the 2s timer
+        no longer destroy()/recreate() every card forever, and surface the
+        'discovery unavailable' case as its own state instead of an endless
+        empty list.
+        """
+        peers = nsd_discovery.get_peers() if nsd_discovery else []
+        if self.bridge is None and _peers is not None:
+            peers = _peers
+
+        signature = self._peer_hash(peers)
+        if signature == self._peer_signature:
+            return
+        self._peer_signature = signature
+
         # Clear old buttons
         while self.nearby_devices_layout.count() > 0:
             item = self.nearby_devices_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        peers = nsd_discovery.get_peers() if nsd_discovery else []
         current_ip = self.txt_peer_name.text().strip()
 
         if not peers:
-            # Empty state with guidance
+            # Empty state with guidance — or a distinct unavailable state.
             empty_container = QWidget()
             empty_container.setStyleSheet("background: transparent;")
             empty_layout = QVBoxLayout(empty_container)
             empty_layout.setContentsMargins(8, 8, 8, 8)
             empty_layout.setSpacing(6)
 
+            if not self.discovery_ok:
+                lbl_none = QLabel("Device discovery unavailable")
+                lbl_none.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-size: {FS_SMALL}; font-weight: bold;")
+                lbl_none.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl_none.setAccessibleName("Device discovery unavailable")
+                empty_layout.addWidget(lbl_none)
+
+                reason = self.discovery_error or ZEROCONF_UNAVAILABLE_REASON or "unknown error"
+                lbl_hint = QLabel(f"{reason}\nUse manual IP entry below, or install it and restart.")
+                lbl_hint.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM};")
+                lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl_hint.setWordWrap(True)
+                lbl_hint.setToolTip(reason)
+                empty_layout.addWidget(lbl_hint)
+
+                self.nearby_devices_layout.addWidget(empty_container)
+                self.lbl_scanning.setText("● Discovery off")
+                self.lbl_scanning.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-size: {FS_META_SM}; font-weight: bold;")
+                self.lbl_scanning.setToolTip(reason)
+                return
+
             lbl_none = QLabel("No devices found on this Wi-Fi")
-            lbl_none.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 9pt; font-weight: bold;")
+            lbl_none.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_SMALL}; font-weight: bold;")
             lbl_none.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_layout.addWidget(lbl_none)
 
             lbl_hint = QLabel("Enable 'Receiving' on the target device to appear here")
-            lbl_hint.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt;")
+            lbl_hint.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM};")
             lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_layout.addWidget(lbl_hint)
 
             self.nearby_devices_layout.addWidget(empty_container)
 
             self.lbl_scanning.setText("● Scanning...")
-            self.lbl_scanning.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt;")
+            self.lbl_scanning.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM};")
+            self.lbl_scanning.setToolTip("")
         else:
             self.lbl_scanning.setText(f"● {len(peers)} device(s) found")
-            self.lbl_scanning.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 8pt; font-weight: bold;")
+            self.lbl_scanning.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: {FS_META_SM}; font-weight: bold;")
+            self.lbl_scanning.setToolTip("")
 
             for peer in peers:
                 is_selected = peer.host == current_ip
 
-                # Create a card-like widget for each peer
-                peer_card = QFrame()
-                peer_card.setFixedHeight(52)
+                # Create a card-like widget for each peer.
+                # Item 11: minimum height so a longer device name can wrap.
+                # Item 20: a real QPushButton (was a QFrame with a monkeypatched
+                # mousePressEvent) so it is focusable, tabbable and has a role.
+                peer_card = QPushButton()
+                peer_card.setMinimumHeight(52)
+                peer_card.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                peer_card.setFlat(True)
                 peer_card.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                 sel_color = SOLORA_ENERGY_GREEN if is_selected else SOLORA_CYAN
+                sel_bg = alpha(SOLORA_ENERGY_GREEN, 0.12) if is_selected else SOLORA_SURFACE_CARD
                 peer_card.setStyleSheet(f"""
-                    QFrame {{
-                        background-color: {'rgba(0,229,153,0.12)' if is_selected else SOLORA_SURFACE_CARD};
+                    QPushButton {{
+                        background-color: {sel_bg};
+                        color: {SOLORA_TEXT_PRIMARY};
                         border: 1px solid {sel_color};
                         border-radius: 10px;
+                        text-align: left;
                     }}
-                    QFrame:hover {{
-                        background-color: rgba(0, 212, 255, 0.15);
+                    QPushButton:hover {{
+                        background-color: {alpha(SOLORA_CYAN, 0.15)};
                         border-color: {SOLORA_CYAN};
                     }}
+                    QPushButton:focus {{ border: 2px solid {SOLORA_TEXT_PRIMARY}; }}
                     QLabel {{ background: transparent; }}
                 """)
+                peer_card.setAccessibleName(f"Connect to {peer.name}")
+                peer_card.setAccessibleDescription(f"{peer.host} port {peer.port}")
+                peer_card.setToolTip(f"{peer.name} — {peer.host}:{peer.port}")
 
                 card_layout = QHBoxLayout(peer_card)
                 card_layout.setContentsMargins(12, 8, 12, 8)
@@ -777,7 +1356,7 @@ class SenderScreen(QWidget):
 
                 # Device icon
                 icon_lbl = QLabel("📱")
-                icon_lbl.setStyleSheet(f"font-size: 16pt; color: {sel_color}; background: transparent;")
+                icon_lbl.setStyleSheet(f"font-size: {FS_XL}; color: {sel_color}; background: transparent;")
                 icon_lbl.setFixedSize(32, 32)
                 card_layout.addWidget(icon_lbl)
 
@@ -786,11 +1365,11 @@ class SenderScreen(QWidget):
                 info_layout.setSpacing(1)
 
                 name_lbl = QLabel(peer.name)
-                name_lbl.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY if not is_selected else sel_color}; font-weight: bold; font-size: 10pt; background: transparent;")
+                name_lbl.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY if not is_selected else sel_color}; font-weight: bold; font-size: {FS_BODY}; background: transparent;")
                 info_layout.addWidget(name_lbl)
 
                 ip_port_lbl = QLabel(f"{peer.host}:{peer.port}")
-                ip_port_lbl.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-family: monospace; font-size: 7.5pt; background: transparent;")
+                ip_port_lbl.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-family: {FONT_MONO}; font-size: {FS_META_XS}; background: transparent;")
                 info_layout.addWidget(ip_port_lbl)
 
                 card_layout.addLayout(info_layout)
@@ -799,74 +1378,220 @@ class SenderScreen(QWidget):
                 # Selected indicator
                 if is_selected:
                     check_lbl = QLabel("✓")
-                    check_lbl.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: 14pt; background: transparent;")
+                    check_lbl.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: {FS_DISPLAY}; background: transparent;")
                     check_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                     check_lbl.setFixedWidth(24)
                     card_layout.addWidget(check_lbl)
 
-                # Make the whole card clickable
-                peer_card.mousePressEvent = lambda e, h=peer.host, p=peer.port, n=peer.name: self.select_peer(h, p, n)
+                peer_card.clicked.connect(
+                    lambda _=False, h=peer.host, p=peer.port, n=peer.name: self.select_peer(h, p, n))
 
                 self.nearby_devices_layout.addWidget(peer_card)
 
         self.nearby_devices_layout.addStretch()
 
     def test_connection(self):
-        ip = self.txt_peer_name.text().strip(); port = self.txt_port.text().strip()
-        client = LinuxTransferClient(f"http://{ip}:{port}")
-        self.lbl_conn.setText("● Testing..."); self.lbl_conn.setStyleSheet(f"color: {SOLORA_AMBER}; font-weight: bold;")
-        QApplication.processEvents()
-        try:
-            res = client.test_connection()
-            self.lbl_conn.setText(f"● Connected ({res.get('service','ok')})")
+        """Item 2: run the /health probe on a worker thread.
+
+        The old version did a blocking ``requests.get(timeout=4)`` plus a
+        re-entrant ``QApplication.processEvents()`` inline on the GUI thread, so
+        every nearby-device / recent-IP click froze the window for up to 4s.
+        """
+        ip = self.txt_peer_name.text().strip()
+        port = self.txt_port.text().strip() or str(SETTINGS.port)
+
+        if not ip:
+            self.lbl_conn.setText("● Enter a host or pick a device")
+            self.lbl_conn.setStyleSheet(f"color: {SOLORA_AMBER}; font-weight: bold;")
+            self.lbl_conn.setToolTip("")
+            return
+
+        # Cancel any in-flight probe: supersede its result and let it finish.
+        if self.conn_tester is not None and self.conn_tester.isRunning():
+            self.conn_tester.client.interrupt()
+
+        self.lbl_conn.setText(f"● Testing {ip}:{port}...")
+        self.lbl_conn.setStyleSheet(f"color: {SOLORA_AMBER}; font-weight: bold;")
+        self.lbl_conn.setToolTip("")
+        self.btn_test.setEnabled(False)
+
+        tester = ConnectionTester(f"http://{ip}:{port}", parent=self)
+        tester.finished_probe.connect(self._on_connection_probe, Qt.ConnectionType.QueuedConnection)
+        self.conn_tester = tester
+        tester.finished.connect(tester.deleteLater)
+        tester.start()
+
+    @pyqtSlot(bool, str, str)
+    def _on_connection_probe(self, ok: bool, message: str, detail: str):
+        self.btn_test.setEnabled(True)
+        if ok:
+            self.lbl_conn.setText(message)
             self.lbl_conn.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold;")
+            self.lbl_conn.setToolTip("")
+            ip = self.txt_peer_name.text().strip()
             if ip and ip != "127.0.0.1":
                 save_recent_ip(ip)
                 self.refresh_recent_ips_ui()
-        except Exception:
-            self.lbl_conn.setText("● Unreachable"); self.lbl_conn.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold;")
+        else:
+            # Item 17: keep the reason instead of a bare "Unreachable".
+            self.lbl_conn.setText(f"{message} — {detail}" if detail else message)
+            self.lbl_conn.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold;")
+            self.lbl_conn.setToolTip(detail)
+            self.lbl_log.setText(
+                f"⚠ {self.txt_peer_name.text().strip()}:{self.txt_port.text().strip()} "
+                f"is not reachable ({detail}). Check the port, the IP, and that "
+                f"'ENABLE RECEIVING' is on at the other end."
+            )
+
+    def set_file(self, path: str):
+        """Item 11/16: single entry point for 'a file was chosen'.
+
+        Used by the file dialog and by the main window's dropEvent, so
+        drag-and-drop feeds exactly the same state as SELECT FILE FROM DISK.
+        """
+        if not path:
+            return
+        self._teardown_worker(cancel=True)
+        self.selected_file = path
+        self.active_file = path
+        self.active_transfer_id = None
+        try:
+            sz = os.path.getsize(path)
+        except OSError as exc:
+            self.lbl_badge.setText("UNREADABLE")
+            self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ALERT_RED, SOLORA_BG))
+            self.lbl_log.setText(f"⚠ Cannot read {path}: {type(exc).__name__}: {exc}")
+            return
+        # Item 23: elide the path, keep the full value as a tooltip.
+        self.lbl_file.setText(elide(os.path.basename(path), self.lbl_file))
+        self.lbl_file.setToolTip(path)
+        self.lbl_vol.setText(f"0 B / {format_size(sz)} (0%)")
+        self.lbl_log.setText(f"Ready to transfer {os.path.basename(path)} ({format_size(sz)})")
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("▶  START TRANSFER")
+        self.prog_bar.setValue(0)
 
     def pick_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select File to Stream", os.path.expanduser("~"))
         if path:
-            self.selected_file = path; self.active_transfer_id = None
-            sz = os.path.getsize(path)
-            self.lbl_file.setText(os.path.basename(path))
-            self.lbl_vol.setText(f"0 B / {format_size(sz)} (0%)")
-            self.lbl_log.setText(f"Ready to transfer {os.path.basename(path)} ({format_size(sz)})")
-            self.btn_start.setEnabled(True); self.prog_bar.setValue(0)
+            self.set_file(path)
+
+    def _teardown_worker(self, cancel: bool = False, wait_ms: int = 4000):
+        """Item 16: stop and reap the previous worker before starting a new one.
+
+        The old code just overwrote ``self.active_worker``, orphaning the old
+        QThread while pause/cancel kept mutating the *new* transfer's client.
+        """
+        worker = self.active_worker
+        if worker is None:
+            self.active_client = None
+            return
+        self.active_worker = None
+        try:
+            worker.request_transfer_interrupt(cancel=cancel)
+        except Exception as exc:
+            print(f"[Sender] interrupt: {type(exc).__name__}: {exc}")
+        if not worker.wait(wait_ms):
+            print("[Sender] previous worker did not stop within "
+                  f"{wait_ms}ms; abandoning it (it is a daemon-less QThread)")
+        worker.deleteLater()
+        self.active_client = None
 
     def start_or_resume(self):
-        if not self.selected_file: return
-        ip = self.txt_peer_name.text().strip(); port = self.txt_port.text().strip()
+        if not self.selected_file:
+            return
+        # Item 16: tear down any previous worker first.
+        self._teardown_worker(cancel=True)
+        ip = self.txt_peer_name.text().strip()
+        port = self.txt_port.text().strip() or str(SETTINGS.port)
         if ip and ip != "127.0.0.1":
             save_recent_ip(ip)
             self.refresh_recent_ips_ui()
-        self.active_client = LinuxTransferClient(f"http://{ip}:{port}")
+        # Item 18: client honours the persisted chunk size / timeout / verify.
+        self.active_client = make_client(f"http://{ip}:{port}")
         self.btn_start.setEnabled(False); self.btn_pick.setEnabled(False)
         self.btn_pause.setEnabled(True); self.btn_cancel.setEnabled(True)
+        self.btn_cancel.setStyleSheet(cancel_button_qss())
+        self._last_progress_emit = 0.0
         self.active_worker = TransferWorker(self.active_client, self.selected_file, self.active_transfer_id)
         self.active_worker.progress_signal.connect(self.on_progress)
         self.active_worker.status_signal.connect(self.on_status)
         self.active_worker.completed_signal.connect(self.on_completed)
+        self.active_worker.paused_signal.connect(self.on_paused)
+        self.active_worker.cancelled_signal.connect(self.on_cancelled)
         self.active_worker.error_signal.connect(self.on_error)
+        self.active_worker.finished.connect(self._on_worker_finished)
         self.active_worker.start()
 
+    def _on_worker_finished(self):
+        self.btn_pause.setEnabled(False)
+        if self.active_worker is not None and self.active_worker.isFinished():
+            self.btn_cancel.setEnabled(False)
+
     def pause_transfer(self):
-        if self.active_client: self.active_client.is_paused = True
+        # Item 3: a real sticky flag the send loop waits on. Previously the
+        # worker raised Exception("Transfer paused by user") -> on_error ->
+        # INTERRUPTED badge, clobbering the PAUSED state immediately.
+        worker = self.active_worker
+        if worker is None or not worker.isRunning():
+            self.lbl_log.setText("Nothing is running to pause.")
+            return
+        try:
+            worker.client.pause()
+        except Exception as exc:
+            self.lbl_log.setText(f"⚠ Could not pause: {type(exc).__name__}: {exc}")
+            return
         self.lbl_badge.setText("PAUSED")
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_AMBER}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_AMBER, SOLORA_BG))
         self.lbl_log.setText("Transfer paused. Byte offset preserved.")
-        self.btn_pause.setEnabled(False); self.btn_start.setText("▶  RESUME"); self.btn_start.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_start.setText("▶  RESUME")
+        self.btn_start.setEnabled(True)
 
     def cancel_transfer(self):
-        if self.active_client: self.active_client.is_cancelled = True
+        # Item 3: disable btn_cancel here (on_error never did), and mark the
+        # cancellation deliberate so the worker's result is CANCELLED, not
+        # INTERRUPTED.
+        worker = self.active_worker
+        self.btn_cancel.setEnabled(False)
+        if worker is None or not worker.isRunning():
+            self._show_cancelled()
+            return
+        try:
+            worker.request_transfer_interrupt(cancel=True)
+        except Exception as exc:
+            print(f"[Sender] cancel: {type(exc).__name__}: {exc}")
+        self._show_cancelled()
+
+    def _show_cancelled(self):
         self.lbl_badge.setText("CANCELLED")
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_ALERT_RED}; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
-        self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
-        self.btn_start.setText("▶  START TRANSFER"); self.btn_start.setEnabled(True); self.btn_pick.setEnabled(True)
+        # Item 8: SOLORA_BG on ALERT_RED is 5.99:1; plain white was 3.27:1.
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ALERT_RED, SOLORA_BG))
+        self.lbl_log.setText("Transfer cancelled by user. Progress discarded.")
+        self.btn_pause.setEnabled(False)
+        self.btn_start.setText("▶  START TRANSFER")
+        self.btn_start.setEnabled(True)
+        self.btn_pick.setEnabled(True)
+
+    def on_paused(self):
+        """Worker confirmed a deliberate pause (not a failure)."""
+        self.lbl_badge.setText("PAUSED")
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_AMBER, SOLORA_BG))
+        self.lbl_log.setText("Transfer paused. Byte offset preserved.")
+        self.btn_pause.setEnabled(False)
+        self.btn_start.setText("▶  RESUME")
+        self.btn_start.setEnabled(True)
+
+    def on_cancelled(self):
+        self._show_cancelled()
 
     def on_progress(self, curr, total, spd, eta):
+        # Item 24: throttle to ~20 Hz. Progress arrives per chunk; with a 1 MiB
+        # chunk that is 3 QLabel.setText + 1 setValue thousands of times.
+        now = time.monotonic()
+        if now - self._last_progress_emit < self._progress_min_interval:
+            return
+        self._last_progress_emit = now
         pct = int((curr/total)*100) if total > 0 else 0
         self.prog_bar.setValue(pct)
         self.lbl_vol.setText(f"{format_size(curr)} / {format_size(total)} ({pct}%)")
@@ -875,85 +1600,142 @@ class SenderScreen(QWidget):
 
     def on_status(self, badge, msg):
         self.lbl_badge.setText(badge.upper())
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_CYAN}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_CYAN, SOLORA_BG))
         self.lbl_log.setText(msg)
+        self.lbl_log.setToolTip(msg)
 
     def on_completed(self, res):
         self.lbl_badge.setText("COMPLETED")
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
-        sha = res.get("calculated_sha256", "")
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ENERGY_GREEN, SOLORA_BG))
+        sha = (res or {}).get("calculated_sha256", "")
         self.lbl_log.setText(f"✓ Transfer Complete! SHA-256: {sha[:16]}...")
+        self.lbl_log.setToolTip(f"SHA-256: {sha}")
         self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
         self.btn_start.setEnabled(True); self.btn_start.setText("▶  START TRANSFER"); self.btn_pick.setEnabled(True)
+        path = self.active_file or self.selected_file
+        try:
+            size = os.path.getsize(path)
+        except (OSError, TypeError):
+            size = 0
         save_history_entry({
-            "filename": os.path.basename(self.selected_file),
-            "size": os.path.getsize(self.selected_file),
+            "filename": os.path.basename(path or ""),
+            "size": size,
             "sha256": sha, "status": "completed",
             "timestamp": datetime.now().isoformat(),
-            "transfer_id": res.get("transfer_id",""),
+            "transfer_id": (res or {}).get("transfer_id", ""),
             "target_ip": self.txt_peer_name.text().strip(),
             "direction": "sent",
-            "file_path": self.selected_file
+            "file_path": path
         })
         QMessageBox.information(self, "Success", "File transfer completed and cryptographically verified!")
 
     def on_error(self, err):
         self.lbl_badge.setText("INTERRUPTED")
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_ALERT_RED}; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
-        self.lbl_log.setText(f"⚠ Interrupted: {err}. Progress saved — tap Resume when ready.")
-        self.btn_pause.setEnabled(False); self.btn_start.setText("▶  RESUME")
+        # Item 8: SOLORA_BG on ALERT_RED = 5.99:1 (was 'white' at 3.27:1).
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ALERT_RED, SOLORA_BG))
+        msg = f"⚠ Interrupted: {err}. Progress saved — tap Resume when ready."
+        self.lbl_log.setText(msg)
+        self.lbl_log.setToolTip(msg)
+        # Item 3: cancel must not stay clickable after a failure.
+        self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
+        self.btn_start.setText("▶  RESUME")
         self.btn_start.setEnabled(True); self.btn_pick.setEnabled(True)
 
     def resume_from_history(self, entry):
         self.active_transfer_id = entry.get("transfer_id")
-        self.txt_peer_name.setText(entry.get("target_ip", "127.0.0.1"))
-        self.lbl_file.setText(entry.get("filename", "Unknown"))
+        target = entry.get("target_ip", "127.0.0.1")
+        # A history target can read "Received from 10.3.207.215"; keep the host.
+        host = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", str(target))
+        self.txt_peer_name.setText(host.group(0) if host else str(target))
+        self.lbl_file.setText(elide(entry.get("filename", "Unknown"), self.lbl_file))
+        self.lbl_file.setToolTip(entry.get("file_path") or entry.get("filename", ""))
         self.lbl_badge.setText("RESUMING")
-        self.lbl_badge.setStyleSheet(f"background: {SOLORA_AMBER}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_AMBER, SOLORA_BG))
         self.lbl_log.setText(f"Resuming session {self.active_transfer_id}...")
         path, _ = QFileDialog.getOpenFileName(self, f"Re-select: {entry.get('filename','')}", os.path.expanduser("~"))
         if path:
             self.selected_file = path
+            self.active_file = path
             self.btn_start.setEnabled(True); self.btn_start.setText("▶  RESUME")
+
+    def shutdown(self):
+        """Item 16: called from the main window's closeEvent."""
+        self._discovery_timer.stop()
+        self._teardown_worker(cancel=True, wait_ms=3000)
+        tester = self.conn_tester
+        self.conn_tester = None
+        if tester is not None:
+            try:
+                tester.client.interrupt()
+                if tester.isRunning():
+                    tester.wait(1500)
+                tester.deleteLater()
+            except Exception as exc:
+                print(f"[Sender] tester shutdown: {type(exc).__name__}: {exc}")
 
 
 # ─── Receiver Screen ──────────────────────────────────────────────────────────
 class ReceiverScreen(QWidget):
     ip_updated_signal = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, bridge: WorkerBridge = None):
         super().__init__(parent)
-        self.server = EmbeddedReceiverServer(host="0.0.0.0", port=8000)
+        self.bridge = bridge
+        # Item 18: the port comes from Settings, not a hardcoded 8000 literal.
+        self.server = EmbeddedReceiverServer(host="0.0.0.0", port=SETTINGS.port)
         self._device_name = load_device_name()
+        self._rx_transfer_id = None
+        self._last_rx_state = {}
         self._build()
+
+        # Item 1: the server used to call this handler directly from an HTTP
+        # request thread (ThreadingMixIn). The bridge re-emits it as a Qt signal
+        # delivered on the GUI thread via QueuedConnection.
+        if bridge is not None:
+            bridge.server_state.connect(self.on_server_state_update,
+                                        Qt.ConnectionType.QueuedConnection)
+            self.server.state_callback = bridge.on_server_state
+        else:
+            # No bridge (headless/unit context): keep it direct but safe.
+            self.server.state_callback = self._direct_state_callback
+
+    def _direct_state_callback(self, rec: dict):
+        try:
+            self.on_server_state_update(dict(rec or {}))
+        except Exception as exc:
+            print(f"[Receiver] state update: {type(exc).__name__}: {exc}")
 
     def _build(self):
         # Wrap everything in a main scroll area so long file lists scroll smoothly
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        
+
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(16)
-        
+
         # 1. Top Bar
         top_row = QHBoxLayout()
         title = QLabel("RECEIVER HUB (P2P)")
-        title.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 11pt; font-weight: bold; letter-spacing: 2px;")
+        title.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: {FS_HEADING}; font-weight: bold; letter-spacing: 2px;")
         top_row.addWidget(title)
         top_row.addStretch()
-        
+
 
         self.btn_toggle_server = QPushButton("⚡  ENABLE RECEIVING")
         self.btn_toggle_server.setFixedHeight(38)
         self.btn_toggle_server.setMinimumWidth(170)
         self.btn_toggle_server.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_toggle_server.setStyleSheet(f"background-color: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; font-weight: bold; border-radius: 8px;")
+        # Item 4: matching :hover so the global cyan hover cannot recolour the
+        # dark label on green/red.
+        self.btn_toggle_server.setStyleSheet(solid_button_qss(SOLORA_ENERGY_GREEN, SOLORA_BG, 8))
+        self.btn_toggle_server.setAccessibleName("Enable or disable receiving")
+        self.btn_toggle_server.setToolTip("Start or stop the receiving endpoint")
         self.btn_toggle_server.clicked.connect(self.toggle_server)
         top_row.addWidget(self.btn_toggle_server)
         layout.addLayout(top_row)
@@ -964,12 +1746,13 @@ class ReceiverScreen(QWidget):
 
         # Device Name section (always visible)
         lbl_device_name_header = QLabel("DEVICE NAME  —  Nearby senders will see this name instead of your IP")
-        lbl_device_name_header.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; letter-spacing: 1px;")
+        lbl_device_name_header.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: {FS_SMALL}; letter-spacing: 1px;")
         cl.addWidget(lbl_device_name_header)
 
         name_row = QHBoxLayout(); name_row.setSpacing(8)
         self.txt_device_name = QLineEdit(self._device_name)
         self.txt_device_name.setPlaceholderText(f"e.g. {socket.gethostname()}")
+        self.txt_device_name.setAccessibleName("This device's advertised name")
         self.txt_device_name.setStyleSheet(f"""
             QLineEdit {{
                 background-color: {SOLORA_SURFACE_ELEVATED};
@@ -977,10 +1760,11 @@ class ReceiverScreen(QWidget):
                 border: 1px solid {SOLORA_BORDER};
                 border-radius: 8px;
                 padding: 7px 12px;
-                font-size: 11pt;
+                font-size: {FS_HEADING};
                 font-weight: bold;
             }}
             QLineEdit:focus {{ border-color: {SOLORA_CYAN}; }}
+            QLineEdit:disabled {{ color: {SOLORA_TEXT_MUTED}; }}
         """)
         self.txt_device_name.textChanged.connect(self._on_device_name_changed)
         name_row.addWidget(self.txt_device_name, 1)
@@ -993,25 +1777,35 @@ class ReceiverScreen(QWidget):
 
         status_row = QHBoxLayout()
         lbl_h = QLabel("INCOMING ENDPOINT — DEVICE B MODE")
-        lbl_h.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: 10pt; letter-spacing: 1px;")
+        lbl_h.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: {FS_BODY}; letter-spacing: 1px;")
         status_row.addWidget(lbl_h)
         status_row.addStretch()
 
         self.lbl_server_status = QLabel("● SERVER OFFLINE")
-        self.lbl_server_status.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold; font-size: 9pt;")
+        self.lbl_server_status.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold; font-size: {FS_SMALL};")
+        self.lbl_server_status.setAccessibleName("Receiver server status")
         status_row.addWidget(self.lbl_server_status)
         cl.addLayout(status_row)
 
         # Show device name + port when enabled (instead of IP)
         self.lbl_broadcast_status = QLabel("Not broadcasting")
-        self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 9pt;")
+        self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_SMALL};")
         cl.addWidget(self.lbl_broadcast_status)
 
         # Subtle IP hint (collapsible)
-        self.ip_hint_label = QLabel("▼  Show local IP (for manual entry)")
-        self.ip_hint_label.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; letter-spacing: 1px;")
+        # Item 20: a real focusable QPushButton instead of a monkeypatched QLabel.
+        self.ip_hint_label = QPushButton("▼  Show local IP (for manual entry)")
+        self.ip_hint_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.ip_hint_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.ip_hint_label.mousePressEvent = lambda e: self._toggle_ip_hint()
+        self.ip_hint_label.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; text-align: left;"
+            f" color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-weight: bold;"
+            f" letter-spacing: 1px; padding: 0; }}"
+            f"QPushButton:hover {{ color: {SOLORA_CYAN}; background: transparent; }}"
+            f"QPushButton:focus {{ color: {SOLORA_CYAN}; }}")
+        self.ip_hint_label.setAccessibleName("Toggle local IP display")
+        self.ip_hint_label.setToolTip("Show or hide this device's local addresses")
+        self.ip_hint_label.clicked.connect(self._toggle_ip_hint)
         cl.addWidget(self.ip_hint_label)
 
         self.ip_hint_widget = QWidget()
@@ -1022,12 +1816,12 @@ class ReceiverScreen(QWidget):
 
         ips = get_local_ips()
         self.current_ip = ips[0] if ips else "127.0.0.1"
-        self.lbl_endpoint = QLabel(f"Local Endpoint:  <span style='color:{SOLORA_NEON_LIME}; font-size:11pt; font-family:monospace;'><b>http://{self.current_ip}:8000</b></span>")
+        self.lbl_endpoint = QLabel(f"Local Endpoint:  <span style='color:{SOLORA_NEON_LIME}; font-size:11pt; font-family:monospace;'><b>http://{self.current_ip}:{SETTINGS.port}</b></span>")
         self.lbl_endpoint.setWordWrap(True)
         ip_hint_layout.addWidget(self.lbl_endpoint)
 
-        self.lbl_more_ips = QLabel("  Also: " + "  |  ".join(f"http://{x}:8000" for x in ips[1:])) if len(ips) > 1 else QLabel("")
-        self.lbl_more_ips.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-family: monospace;")
+        self.lbl_more_ips = QLabel("  Also: " + "  |  ".join(f"http://{x}:{SETTINGS.port}" for x in ips[1:])) if len(ips) > 1 else QLabel("")
+        self.lbl_more_ips.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-family: {FONT_MONO};")
         ip_hint_layout.addWidget(self.lbl_more_ips)
 
         cl.addWidget(self.ip_hint_widget)
@@ -1036,7 +1830,11 @@ class ReceiverScreen(QWidget):
         self.lbl_qr = QLabel()
         self.lbl_qr.setStyleSheet("background: white; padding: 6px; border-radius: 8px;")
         self.lbl_qr.setFixedSize(160,160)
-        self.update_qr(f"http://{self.current_ip}:8000")
+        # Item 20: alt text for the QR (it carries the pairing payload).
+        self.lbl_qr.setAccessibleName("Pairing QR code")
+        self.lbl_qr.setAccessibleDescription(
+            "Scan or copy this code on the sender device to prefill host and port.")
+        self.update_qr(build_pairing_url(self.current_ip, SETTINGS.port, self._device_name))
         qr_row.addWidget(self.lbl_qr)
 
         qr_row.addSpacing(16)
@@ -1155,9 +1953,13 @@ class ReceiverScreen(QWidget):
         layout.addStretch()
         scroll.setWidget(content)
         outer_layout.addWidget(scroll)
-        
-        # Auto connect callback
-        self.server.state_callback = self.on_server_state_update
+
+        # NOTE: do NOT re-assign self.server.state_callback here.
+        # __init__ already wired it through WorkerBridge so the HTTP request
+        # thread only emits a Qt signal delivered on the GUI thread. Assigning
+        # the widget handler directly (as this line used to) made every HTTP
+        # worker thread call QLabel.setText / setStyleSheet / deleteLater
+        # off the GUI thread.
         self.refresh_received_files()
 
     def refresh_ip(self):
@@ -1490,6 +2292,9 @@ class NexusFlowLinuxApp(QMainWindow):
         self.setWindowTitle("NEXUS FLOW — Smart Resumable File Transfer")
         self.resize(1080, 720)
         self.setMinimumSize(860, 620)
+        # Accept files dropped anywhere on the window (see dropEvent).
+        self.setAcceptDrops(True)
+        self._restore_window_state()
 
         logo_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -1561,6 +2366,58 @@ class NexusFlowLinuxApp(QMainWindow):
         self.drawer_open = not self.drawer_open
         self.drawer.setVisible(self.drawer_open)
 
+    # ── Persisted window state ────────────────────────────────────────────
+    # Size, position and drawer state used to reset to 1080x720 with the drawer
+    # closed on every launch. Stored via QSettings so the app reopens where the
+    # user left it.
+    def _restore_window_state(self):
+        store = _settings_store()
+        geom = store.value("window/geometry")
+        if geom:
+            try:
+                self.restoreGeometry(geom)
+            except (TypeError, ValueError):
+                pass  # corrupt payload from an older build; fall back to default
+        self.drawer_open = str(store.value("window/drawer_open", "false")).lower() == "true"
+        if hasattr(self, "drawer"):
+            self.drawer.setVisible(self.drawer_open)
+
+    def _save_window_state(self):
+        store = _settings_store()
+        store.setValue("window/geometry", self.saveGeometry())
+        store.setValue("window/drawer_open", "true" if self.drawer_open else "false")
+
+    # ── Drag and drop ─────────────────────────────────────────────────────
+    # A file-transfer app should accept a file dropped anywhere on the window.
+    # Routing it through SenderScreen.set_file() means a dropped file lands in
+    # exactly the same state as one chosen with SELECT FILE FROM DISK.
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        path = next(
+            (u.toLocalFile() for u in urls if u.isLocalFile() and os.path.isfile(u.toLocalFile())),
+            None,
+        )
+        if not path:
+            if hasattr(self, "sender_screen"):
+                self.sender_screen.lbl_log.setText(
+                    "⚠ That drop contained no readable local file."
+                )
+            event.ignore()
+            return
+        # Only the sender page has a file slot; switch to it first.
+        self.drawer.set_active(0)
+        self._on_nav(0)
+        self.sender_screen.set_file(path)
+        event.acceptProposedAction()
+
     def _on_nav(self, idx):
         self.stack.setCurrentIndex(idx)
         self.lbl_page.setText(self.PAGE_TITLES[idx])
@@ -1581,6 +2438,39 @@ class NexusFlowLinuxApp(QMainWindow):
         self.sender_screen.resume_from_history(entry)
 
     def closeEvent(self, event):
+        # Persist geometry/drawer so the next launch reopens where we left off.
+        try:
+            self._save_window_state()
+        except Exception as exc:  # never block shutdown on a settings write
+            print(f"[warn] could not save window state: {type(exc).__name__}: {exc}")
+        # Stop the sender worker before the receiver server: a live QThread
+        # holding a socket will otherwise outlive the window.
+        if hasattr(self, "sender_screen"):
+            sender = self.sender_screen
+            # In-flight connection probe: interrupt its socket so the thread
+            # returns promptly, then reap it. Without this, closing the window
+            # during a ping destroys a running QThread (crash on exit).
+            tester = getattr(sender, "conn_tester", None)
+            if tester is not None:
+                try:
+                    if tester.isRunning():
+                        tester.client.interrupt()
+                        # /health is bounded by min(timeout, 10s), so give the
+                        # thread room to unwind. Forcing deleteLater() on a
+                        # still-running QThread aborts the interpreter with
+                        # "QThread: Destroyed while thread is still running".
+                        if not tester.wait(12000):
+                            print("[warn] connection probe did not stop in 12s")
+                    else:
+                        tester.deleteLater()
+                except Exception as exc:
+                    print(f"[warn] ping teardown: {type(exc).__name__}: {exc}")
+                sender.conn_tester = None
+            # Active transfer worker: request interruption, wait, reap.
+            try:
+                sender._teardown_worker(cancel=True)
+            except Exception as exc:
+                print(f"[warn] worker teardown: {type(exc).__name__}: {exc}")
         # Stop receiver server on app close
         if hasattr(self, 'receiver_screen') and self.receiver_screen.server:
             self.receiver_screen.server.stop()
@@ -1591,11 +2481,11 @@ class NexusFlowLinuxApp(QMainWindow):
             QMainWindow, #centralRoot {{
                 background-color: {SOLORA_BG};
                 color: {SOLORA_TEXT_PRIMARY};
-                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+                font-family: {FONT_STACK};
             }}
             QWidget {{
                 color: {SOLORA_TEXT_PRIMARY};
-                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+                font-family: {FONT_STACK};
             }}
             QLabel {{
                 background-color: transparent;

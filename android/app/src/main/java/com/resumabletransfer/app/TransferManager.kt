@@ -4,11 +4,13 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.security.MessageDigest
@@ -38,6 +40,21 @@ class TransferManager private constructor(private val context: Context) {
         private const val KEY_EXPECTED_SHA256 = "expected_sha256"
         private const val KEY_CHUNK_SIZE_KB = "chunk_size_kb"
         private const val KEY_THROTTLE_DELAY_MS = "throttle_delay_ms"
+
+        /**
+         * Minimum gap between UI progress emissions. The transfer loop can
+         * complete a 1 MB chunk every few ms on a fast link; emitting each one
+         * forces a full screen recomposition for a sub-frame change.
+         */
+        const val PROGRESS_EMIT_INTERVAL_MS = 120L
+
+        /** Statuses that must reach the UI immediately, never throttled. */
+        private val TERMINAL_STATUSES = setOf(
+            TransferStatus.COMPLETED,
+            TransferStatus.FAILED,
+            TransferStatus.INTERRUPTED,
+            TransferStatus.CANCELLED
+        )
         private const val KEY_RECENT_IPS = "recent_ips_list"
         private const val KEY_DEVICE_NAME = "device_name"
     }
@@ -47,6 +64,10 @@ class TransferManager private constructor(private val context: Context) {
 
     private val _progressState = MutableStateFlow(TransferProgress(status = TransferStatus.IDLE))
     val progressState: StateFlow<TransferProgress> = _progressState.asStateFlow()
+
+    /** Timestamp of the last throttled emission; guarded by the flow's own lock. */
+    @Volatile
+    private var lastEmitAt = 0L
 
     private var transferJob: Job? = null
     private var activeApiClient: TransferApiClient? = null
@@ -141,8 +162,40 @@ class TransferManager private constructor(private val context: Context) {
         _progressState.value = TransferProgress(status = TransferStatus.IDLE)
     }
 
+    /**
+     * Atomically updates progress state.
+     *
+     * The previous body was `_progressState.value = update(_progressState.value)`,
+     * a read-modify-write that raced: the IO loop (calling updateProgress from
+     * inside its own transfer lambda) could interleave with pauseTransfer /
+     * cancelTransfer / resumeTransfer running on the main thread, silently
+     * dropping one of the two updates. `MutableStateFlow.update` retries the
+     * transform under a lock, so no update is lost.
+     */
     fun updateProgress(update: (TransferProgress) -> TransferProgress) {
-        _progressState.value = update(_progressState.value)
+        _progressState.update(update)
+    }
+
+    /**
+     * Throttled variant for the per-chunk hot path.
+     *
+     * The transfer loop calls [updateProgress] once per 1 MB chunk. With a fast
+     * link that is tens of emissions per second, each one invalidating the whole
+     * Compose screen. This coalesces to at most one emission every
+     * [PROGRESS_EMIT_INTERVAL_MS] while still forcing terminal states
+     * (COMPLETED / FAILED / INTERRUPTED / CANCELLED) through immediately so the
+     * UI never lags behind the real outcome.
+     */
+    fun updateProgressThrottled(update: (TransferProgress) -> TransferProgress) {
+        val next = _progressState.value.let(update)
+        val isTerminal = next.status in TERMINAL_STATUSES
+        val now = SystemClock.elapsedRealtime()
+        val last = lastEmitAt
+        if (!isTerminal && now - last < PROGRESS_EMIT_INTERVAL_MS) {
+            return
+        }
+        lastEmitAt = now
+        _progressState.value = next
     }
 
     fun calculateSha256(uri: Uri): String {
@@ -401,7 +454,7 @@ class TransferManager private constructor(private val context: Context) {
                             }
 
                             val isFinal = (confirmedOffset >= fileSize)
-                            updateProgress {
+                            updateProgressThrottled {
                                 it.copy(
                                     status = if (isFinal) {
                                         if (result.sha256Verified) TransferStatus.COMPLETED else TransferStatus.FAILED
@@ -420,7 +473,7 @@ class TransferManager private constructor(private val context: Context) {
                         } else {
                             retryCount++
                             val err = uploadRes.exceptionOrNull()?.localizedMessage ?: "Network connection lost"
-                            updateProgress {
+                            updateProgressThrottled {
                                 it.copy(
                                     logMessage = "Interruption detected: $err"
                                 )

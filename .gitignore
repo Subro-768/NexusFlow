@@ -11,3 +11,4 @@ android/build/
 android/local.properties
 *.db
 server/transfers.db
+android/.kotlin/

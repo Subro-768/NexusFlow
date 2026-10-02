@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.OpenableColumns
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -18,6 +17,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,6 +30,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.resumabletransfer.app.server.EmbeddedTransferServer
 import com.resumabletransfer.app.ui.ReceiverScreen
@@ -50,6 +52,13 @@ enum class ScreenNav(val title: String) {
     HISTORY("Transfer History"),
     SETTINGS("Settings")
 }
+
+private const val NEXUS_SCHEME = "nexus://"
+private const val DEFAULT_PORT = 8000
+
+private const val STATE_URI = "state_selected_uri"
+private const val STATE_FILENAME = "state_selected_filename"
+private const val STATE_FILESIZE = "state_selected_filesize"
 
 class MainActivity : ComponentActivity() {
 
@@ -73,6 +82,88 @@ class MainActivity : ComponentActivity() {
     private var discoveredPeers by mutableStateOf<List<PeerDevice>>(emptyList())
     private var isDiscovering by mutableStateOf(false)
 
+    /**
+     * Feedback channel. Every `Toast.makeText` call in this Activity (there
+     * were ten) is replaced by a snackbar so messages are anchored to the app,
+     * survive a configuration change, and can carry an action. Toasts raised
+     * from inside a composable cannot do any of that.
+     */
+    private val snackbarHostState = SnackbarHostState()
+
+    private fun notifyUser(message: String) {
+        lifecycleScope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
+    /**
+     * Handles a scanned or pasted `nexus://` pairing payload by pre-filling the
+     * target host and port. The QR button used to render as an enabled icon with
+     * an empty body while the desktop build encoded this scheme, so scanning a
+     * peer's code previously did nothing at all.
+     */
+    private fun applyPairingUri(raw: String) {
+        val uri = raw.trim()
+        val host: String?
+        val port: Int?
+        when {
+            uri.startsWith(NEXUS_SCHEME) -> {
+                val authority = uri.removePrefix(NEXUS_SCHEME)
+                    .substringBefore('?')
+                    .trim('/')
+                val hostPart = authority.substringBefore(':')
+                val portPart = authority.substringAfter(':', "")
+                host = hostPart.takeIf { it.isNotBlank() }
+                port = portPart.toIntOrNull() ?: DEFAULT_PORT
+            }
+            uri.startsWith("http://") || uri.startsWith("https://") -> {
+                val withoutScheme = uri.substringAfter("://")
+                host = withoutScheme.substringBefore('/').substringBefore(':').takeIf { it.isNotBlank() }
+                port = withoutScheme.substringAfter(':', "").substringBefore('/').toIntOrNull() ?: DEFAULT_PORT
+            }
+            else -> {
+                host = null
+                port = null
+            }
+        }
+        if (host == null) {
+            notifyUser(getString(R.string.msg_pairing_unrecognised))
+            return
+        }
+        serverIp = host
+        if (port != null) serverPort = port.toString()
+        transferManager.setSavedServerIp(serverIp)
+        transferManager.setSavedServerPort(serverPort)
+        notifyUser(getString(R.string.msg_pairing_connected, serverIp, serverPort))
+        testConnection()
+    }
+
+    /**
+     * Manual entry for a pairing code.
+     *
+     * A camera-based scanner would need a camera permission plus a dependency,
+     * so the dialog accepts a pasted or typed `nexus://host:port` payload -- the
+     * exact string the desktop Receiver screen puts in its QR. This turns the
+     * previously dead scan button into a working control, and it is the same code
+     * path a real ML Kit scanner would feed.
+     */
+    private fun showPairingCodeDialog() {
+        val input = android.widget.EditText(this).apply {
+            hint = "nexus://192.168.1.5:8000"
+            setSingleLine()
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(R.string.msg_qr_scanned)
+            .setMessage(R.string.pairing_dialog_message)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                applyPairingUri(input.text.toString())
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
     private val filePickerLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -91,7 +182,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         if (!isGranted) {
-            Toast.makeText(this, "Notification permission needed for background transfers", Toast.LENGTH_SHORT).show()
+            notifyUser(getString(R.string.msg_notification_permission))
         }
     }
 
@@ -116,11 +207,22 @@ class MainActivity : ComponentActivity() {
         // Start peer discovery immediately (sender view)
         startPeerDiscovery()
 
-        // Fresh cold start: reset active file selection and transfer state to IDLE
-        selectedFileName = null
-        selectedFileSize = null
-        selectedFileUri = null
-        transferManager.clearSavedSession()
+        // Only on a genuine cold start. onCreate also runs on every configuration
+        // change (rotation, theme switch, multi-window resize), and
+        // clearSavedSession() cancels the running transfer job and wipes
+        // KEY_URI/KEY_FILENAME/KEY_FILESIZE. Without this guard, rotating the
+        // device mid-transfer destroyed the transfer and lost the file
+        // reference -- in a resumable transfer app.
+        if (savedInstanceState == null) {
+            selectedFileName = null
+            selectedFileSize = null
+            selectedFileUri = null
+            transferManager.clearSavedSession()
+        } else {
+            selectedFileUri = savedInstanceState.getString(STATE_URI)?.let(Uri::parse)
+            selectedFileName = savedInstanceState.getString(STATE_FILENAME)
+            selectedFileSize = savedInstanceState.getLong(STATE_FILESIZE, 0L).takeIf { it > 0L }
+        }
 
         checkNotificationPermission()
 
@@ -129,8 +231,12 @@ class MainActivity : ComponentActivity() {
                 val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
                 val scope = rememberCoroutineScope()
                 var currentScreen by remember { mutableStateOf(ScreenNav.TRANSFER) }
-                val progress by transferManager.progressState.collectAsState()
-                val incomingTransfer by (embeddedServer?.incomingState ?: MutableStateFlow(null)).collectAsState()
+                // collectAsStateWithLifecycle stops collecting when the Activity
+                // is not STARTED. With plain collectAsState the progress flow kept
+                // driving recompositions for a backgrounded app.
+                val progress by transferManager.progressState.collectAsStateWithLifecycle()
+                val incomingTransfer by (embeddedServer?.incomingState
+                    ?: remember { MutableStateFlow(null) }).collectAsStateWithLifecycle()
 
                 BackHandler(enabled = drawerState.isOpen || currentScreen != ScreenNav.TRANSFER) {
                     if (drawerState.isOpen) {
@@ -287,6 +393,9 @@ class MainActivity : ComponentActivity() {
                                         transferManager.setSavedServerPort(peer.port.toString())
                                         testConnection()
                                     },
+                                    // These two were empty-bodied buttons before.
+                                    onRefreshPeers = { startPeerDiscovery() },
+                                    onScanQr = { showPairingCodeDialog() },
                                     onTestConnection = { testConnection() },
                                     connectionStatusText = connectionStatusText,
                                     isConnected = isConnected,
@@ -299,7 +408,8 @@ class MainActivity : ComponentActivity() {
                                     onPauseTransfer = { pauseTransfer() },
                                     onResumeTransfer = { resumeTransfer() },
                                     onCancelTransfer = { cancelTransfer() },
-                                    onNewTransfer = { handleNewTransfer() }
+                                    onNewTransfer = { handleNewTransfer() },
+                                    snackbarHostState = snackbarHostState
                                 )
                             }
                             ScreenNav.RECEIVER -> {
@@ -316,20 +426,20 @@ class MainActivity : ComponentActivity() {
                                                 // Register NSD service so senders can discover this device by name
                                                 val name = deviceName.ifBlank { transferManager.getDeviceName() }
                                                 nsdHelper?.registerService(name, 8000)
-                                                Toast.makeText(this@MainActivity, "Receiver Started — Broadcasting as \"$name\"", Toast.LENGTH_SHORT).show()
+                                                notifyUser(getString(R.string.msg_receiver_started, name))
                                             } else {
-                                                Toast.makeText(this@MainActivity, "Failed to start server (port in use?)", Toast.LENGTH_LONG).show()
+                                                notifyUser(getString(R.string.msg_receiver_start_failed))
                                             }
                                         } else {
                                             embeddedServer?.stop()
                                             nsdHelper?.unregisterService()
                                             isReceiverRunning = false
-                                            Toast.makeText(this@MainActivity, "Receiver Server Stopped", Toast.LENGTH_SHORT).show()
+                                            notifyUser(getString(R.string.msg_receiver_stopped))
                                         }
                                     },
                                     onRefreshIp = {
                                         receiverIps = embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
-                                        Toast.makeText(this@MainActivity, "IP Refreshed: ${receiverIps.firstOrNull() ?: "127.0.0.1"}", Toast.LENGTH_SHORT).show()
+                                        notifyUser(getString(R.string.msg_ip_refreshed, receiverIps.firstOrNull() ?: "127.0.0.1"))
                                     },
                                     onMenuClick = { scope.launch { drawerState.open() } },
                                     onOpenDownloads = { openReceivedDownloadsFolder() },
@@ -373,7 +483,7 @@ class MainActivity : ComponentActivity() {
             }
             startActivity(intent)
         } catch (e: Exception) {
-            Toast.makeText(this, "Files saved in Downloads/NexusFlow", Toast.LENGTH_LONG).show()
+            notifyUser(getString(R.string.msg_files_saved_in))
         }
     }
 
@@ -410,7 +520,7 @@ class MainActivity : ComponentActivity() {
 
         val uri = selectedFileUri ?: transferManager.getSavedFileUri()
         if (uri == null) {
-            Toast.makeText(this, "Please pick '${session.filename}' to resume bytes", Toast.LENGTH_LONG).show()
+            notifyUser(getString(R.string.msg_pick_to_resume_history, session.filename))
             filePickerLauncher.launch(arrayOf("*/*"))
             return
         }
@@ -500,7 +610,7 @@ class MainActivity : ComponentActivity() {
     private fun resumeTransfer() {
         val uri = selectedFileUri ?: transferManager.getSavedFileUri()
         if (uri == null) {
-            Toast.makeText(this, "Please select the file from device to resume", Toast.LENGTH_SHORT).show()
+            notifyUser(getString(R.string.msg_select_file_to_resume))
             filePickerLauncher.launch(arrayOf("*/*"))
             return
         }
@@ -531,15 +641,29 @@ class MainActivity : ComponentActivity() {
 
     private fun startPeerDiscovery() {
         val ownIps = embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
+        val helper = nsdHelper ?: run {
+            isDiscovering = false
+            return
+        }
         isDiscovering = true
-        val helper = nsdHelper ?: return
         helper.startDiscovery(ownIps)
-        // Collect discovered peers into state
+        // NsdHelper.peers is a StateFlow, so collect() replays the current value.
+        // When discovery stops (listener torn down) the empty list arrives here
+        // and isDiscovering must be cleared -- previously it was only ever set
+        // to true, so the panel said "Looking for devices..." indefinitely.
         lifecycleScope.launch {
             helper.peers.collect { peers ->
                 discoveredPeers = peers
+                isDiscovering = false
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        selectedFileUri?.let { outState.putString(STATE_URI, it.toString()) }
+        outState.putString(STATE_FILENAME, selectedFileName)
+        outState.putLong(STATE_FILESIZE, selectedFileSize ?: 0L)
     }
 
     override fun onDestroy() {

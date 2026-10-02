@@ -1,3 +1,126 @@
 <resources>
     <string name="app_name">NEXUS FLOW</string>
+
+    <!-- App bar -->
+    <string name="brand_name_full">NEXUS </string>
+    <string name="brand_name_accent">FLOW</string>
+    <string name="brand_tagline">SMART FILE TRANSFER</string>
+    <string name="cd_logo">Nexus Flow logo</string>
+    <string name="cd_open_menu">Open navigation menu</string>
+    <string name="cd_new_transfer">New transfer</string>
+    <string name="action_new_transfer">New Transfer</string>
+
+    <!-- Navigation -->
+    <string name="nav_sender">Sender Mode</string>
+    <string name="nav_receiver">Receiver Hub (P2P)</string>
+    <string name="nav_history">Transfer History</string>
+    <string name="nav_settings">Settings</string>
+    <string name="nav_connected_server">Connected Server</string>
+
+    <!-- Transfer screen -->
+    <string name="card_data_flow">DATA FLOW</string>
+    <string name="card_payload_source">PAYLOAD SOURCE</string>
+    <string name="card_target_endpoint">TARGET ENDPOINT (DEVICE B)</string>
+    <string name="card_nearby_devices">NEARBY DEVICES (Tap to select)</string>
+    <string name="recent_targets">RECENT TARGETS</string>
+    <string name="card_transmission_log">TRANSMISSION LOG</string>
+
+    <string name="metric_volume">VOLUME</string>
+    <string name="metric_rate">RATE</string>
+    <string name="metric_estimated">ESTIMATED</string>
+    <string name="metric_real_time">Real-time</string>
+    <string name="metric_time_left">Time Left</string>
+    <string name="value_of_format">of %1$s</string>
+    <string name="value_unknown">--</string>
+
+    <string name="btn_start_transfer">START TRANSFER</string>
+    <string name="btn_pause">PAUSE</string>
+    <string name="btn_cancel">CANCEL</string>
+    <string name="btn_resume">RESUME (%1$d%%)</string>
+    <string name="btn_reset">RESET</string>
+    <string name="btn_new_transfer">NEW TRANSFER</string>
+    <string name="btn_select_file">SELECT FILE</string>
+    <string name="btn_change_file">CHANGE FILE</string>
+    <string name="btn_ping_server">PING SERVER</string>
+
+    <string name="label_device_ip">DEVICE IP</string>
+    <string name="hint_device_ip">192.168.x.x / 127.0.0.1</string>
+    <string name="label_port">PORT</string>
+    <string name="hint_port">8000</string>
+
+    <string name="cd_copy_hash">Copy hash</string>
+    <string name="toast_hash_copied">Hash copied to clipboard</string>
+    <string name="sha_verified">SHA-256 Verified 100%</string>
+
+    <string name="nearby_empty_searching">Looking for devices with receiving enabled on this Wi-Fi…</string>
+    <string name="nearby_empty_idle">No devices found. Make sure the target device has \'Enable Receiving\' turned on.</string>
+    <string name="cd_refresh_nearby">Refresh nearby devices</string>
+    <string name="cd_scan_qr">Scan pairing QR code</string>
+    <string name="peer_port_format">Port %1$d</string>
+    <string name="peer_selected">Selected</string>
+    <string name="peer_unselected">Discovered device</string>
+
+    <string name="log_ready">System ready.</string>
+    <string name="log_prefix">&gt; %1$s</string>
+
+    <!-- Status badges -->
+    <string name="status_idle">STANDBY</string>
+    <string name="status_connecting">CONNECTING…</string>
+    <string name="status_ready">READY</string>
+    <string name="status_transferring">STREAMING</string>
+    <string name="status_paused">PAUSED</string>
+    <string name="status_interrupted">INTERRUPTED</string>
+    <string name="status_completed">COMPLETED</string>
+    <string name="status_failed">FAILED</string>
+    <string name="status_cancelled">CANCELLED</string>
+    <string name="status_verified">VERIFIED</string>
+
+    <!-- Errors -->
+    <string name="error_headline">Transfer failed</string>
+
+    <!-- Receiver -->
+    <string name="receiver_enable">Enable Receiving</string>
+    <string name="receiver_refresh_ip">Refresh IP</string>
+    <string name="cd_refresh_ip">Refresh local IP address</string>
+    <string name="cd_open_downloads">Open downloads folder</string>
+    <string name="receiver_no_files">No files received yet</string>
+    <string name="cd_qr_code">Connection QR code for %1$s</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_saved">Settings saved</string>
+    <string name="settings_session_cleared">Saved session cache cleared.</string>
+
+    <!-- Toast / snackbar messages -->
+    <string name="msg_notification_permission">Notification permission needed for background transfers</string>
+    <string name="msg_receiver_started">Receiver Started — Broadcasting as \"%1$s\"</string>
+    <string name="msg_receiver_start_failed">Failed to start server (port in use?)</string>
+    <string name="msg_receiver_stopped">Receiver Server Stopped</string>
+    <string name="msg_ip_refreshed">IP Refreshed: %1$s</string>
+    <string name="msg_files_saved_in">Files saved in Downloads/NexusFlow</string>
+    <string name="msg_pick_to_resume_history">Please pick \'%1$s\' to resume bytes</string>
+    <string name="msg_select_file_to_resume">Please select the file from device to resume</string>
+    <string name="msg_testing">Testing…</string>
+    <string name="msg_connected">Connected (%1$s)</string>
+    <string name="msg_adb_reverse">Run: adb reverse tcp:8000 tcp:8000</string>
+    <string name="msg_connection_failed">Connection Failed</string>
+    <string name="msg_could_not_open_file">Could not open file: %1$s</string>
+    <string name="msg_pairing_unrecognised">Could not read that pairing code</string>
+    <string name="msg_pairing_connected">Target set to %1$s:%2$s</string>
+    <string name="msg_qr_scanned">Pairing code</string>
+    <string name="pairing_dialog_message">Paste or type the pairing code shown by the receiving device (nexus://host:port).</string>
+
+    <!-- Content descriptions: receiver/history -->
+    <string name="cd_verified">Verified</string>
+    <string name="cd_refresh">Refresh</string>
+    <string name="cd_open">Open</string>
+    <string name="history_empty">No transfers recorded yet</string>
+    <string name="history_resume">Resume</string>
+
+    <!-- Formatting: keep decimal point locale-independent for byte math -->
+    <string name="fmt_bytes_format">%1$s %2$s</string>
+    <plurals name="fmt_bytes_remaining">
+        <item quantity="one">%1$d byte remaining</item>
+        <item quantity="other">%1$d bytes remaining</item>
+    </plurals>
 </resources>

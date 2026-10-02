@@ -9,12 +9,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.resumabletransfer.app.R
 import com.resumabletransfer.app.TransferManager
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -23,49 +28,24 @@ fun SettingsScreen(
     onMenuClick: () -> Unit
 ) {
     val scrollState = rememberScrollState()
-    var chunkSizeKb by remember { mutableStateOf(transferManager.getChunkSizeKb()) }
-    var throttleDelayMs by remember { mutableStateOf(transferManager.getThrottleDelayMs()) }
-    var showSnackbar by remember { mutableStateOf(false) }
+    // rememberSaveable so the typed values survive rotation. rememberSaveable
+    // also requires the values to be Bundle-saveable, hence the primitives.
+    var chunkSizeKb by rememberSaveable { mutableStateOf(transferManager.getChunkSizeKb()) }
+    var throttleDelayMs by rememberSaveable { mutableStateOf(transferManager.getThrottleDelayMs()) }
+    // A real SnackbarHostState instead of a boolean: the old version popped in
+    // with no enter/exit animation and vanished on navigation.
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
 
     Scaffold(
-        containerColor = SoloraBgDark,
+        containerColor = MaterialTheme.colorScheme.background,
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        "SYSTEM CONFIG",
-                        fontWeight = FontWeight.Black,
-                        fontSize = 17.sp,
-                        letterSpacing = 1.5.sp,
-                        color = SoloraTextPrimary
-                    )
-                },
-                navigationIcon = {
-                    IconButton(onClick = onMenuClick) {
-                        Icon(Icons.Default.Menu, contentDescription = "Open menu", tint = SoloraTextPrimary)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SoloraBgDark,
-                    titleContentColor = SoloraTextPrimary
-                )
+            NexusTopBar(
+                subtitle = stringResource(R.string.settings_title),
+                onMenuClick = onMenuClick
             )
-        },
-        snackbarHost = {
-            if (showSnackbar) {
-                Snackbar(
-                    modifier = Modifier.padding(16.dp),
-                    containerColor = SoloraSurfaceElevated,
-                    contentColor = SoloraTextPrimary,
-                    action = {
-                        TextButton(onClick = { showSnackbar = false }) {
-                            Text("OK", color = SoloraNeonLime, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                ) {
-                    Text("Saved session cache cleared.")
-                }
-            }
         }
     ) { padding ->
         Column(
@@ -211,7 +191,11 @@ fun SettingsScreen(
                     OutlinedButton(
                         onClick = {
                             transferManager.clearSavedSession()
-                            showSnackbar = true
+                            scope.launch {
+                                snackbarHostState.showSnackbar(
+                                    context.getString(R.string.settings_session_cleared)
+                                )
+                            }
                         },
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = SoloraAlertRed),
                         border = BorderStroke(1.dp, SoloraAlertRed.copy(alpha = 0.5f)),

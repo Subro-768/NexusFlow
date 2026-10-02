@@ -16,6 +16,12 @@ try:
 except ImportError:
     ZEROCONF_AVAILABLE = False
 
+#: Human-readable reason discovery is unavailable, or None when it is available.
+ZEROCONF_UNAVAILABLE_REASON = None if ZEROCONF_AVAILABLE else (
+    "The 'zeroconf' Python package is not installed — mDNS device discovery is "
+    "disabled. Install it with: pip install zeroconf"
+)
+
 
 SERVICE_TYPE = "_nexusflow._tcp.local."
 
@@ -53,11 +59,15 @@ class NsdAdvertiser:
         self._zeroconf: Optional[Zeroconf] = None
         self._info: Optional[ServiceInfo] = None
         self._lock = threading.Lock()
+        self.last_error: Optional[str] = ZEROCONF_UNAVAILABLE_REASON
+        self.available: bool = ZEROCONF_AVAILABLE
 
     def start(self, device_name: str, port: int = 8000) -> bool:
         """Register the mDNS service. Returns True on success."""
         if not ZEROCONF_AVAILABLE:
-            print("[NSD] zeroconf not installed — device name broadcasting disabled.")
+            self.last_error = ZEROCONF_UNAVAILABLE_REASON
+            self.available = False
+            print(f"[NSD] {self.last_error}")
             return False
 
         with self._lock:
@@ -76,10 +86,14 @@ class NsdAdvertiser:
                 )
                 self._zeroconf = Zeroconf()
                 self._zeroconf.register_service(self._info)
+                self.last_error = None
+                self.available = True
                 print(f"[NSD] Broadcasting as '{safe_name}' at {local_ip}:{port}")
                 return True
             except Exception as e:
-                print(f"[NSD] Failed to register service: {e}")
+                self.last_error = f"{type(e).__name__}: {e}"
+                print(f"[NSD] Failed to register service: {self.last_error}")
+                self.available = False
                 self._zeroconf = None
                 self._info = None
                 return False
@@ -112,9 +126,21 @@ class _NexusFlowListener:
         self._peers: Dict[str, PeerInfo] = {}
         self._lock = threading.Lock()
         self._on_change: Optional[Callable] = None
+        #: Set when a change callback raised, so the failure is not lost.
+        self.last_callback_error: Optional[str] = None
 
     def set_on_change(self, callback: Callable):
         self._on_change = callback
+
+    def _fire_change(self) -> None:
+        """Invoke the on_change callback. Runs on the zeroconf listener thread."""
+        if not self._on_change:
+            return
+        try:
+            self._on_change(self.get_peers())
+        except Exception as exc:
+            # A raising callback must not kill the listener thread.
+            self.last_callback_error = f"{type(exc).__name__}: {exc}"
 
     def add_service(self, zc: "Zeroconf", type_: str, name: str):
         info = zc.get_service_info(type_, name)
@@ -128,8 +154,7 @@ class _NexusFlowListener:
         peer = PeerInfo(name=display_name, host=host, port=info.port)
         with self._lock:
             self._peers[name] = peer
-        if self._on_change:
-            self._on_change(self.get_peers())
+        self._fire_change()
 
     def update_service(self, zc: "Zeroconf", type_: str, name: str):
         self.add_service(zc, type_, name)
@@ -137,8 +162,7 @@ class _NexusFlowListener:
     def remove_service(self, zc: "Zeroconf", type_: str, name: str):
         with self._lock:
             self._peers.pop(name, None)
-        if self._on_change:
-            self._on_change(self.get_peers())
+        self._fire_change()
 
     def get_peers(self) -> List[PeerInfo]:
         with self._lock:
@@ -157,13 +181,22 @@ class NsdDiscovery:
         self._browser = None
         self._listener: Optional[_NexusFlowListener] = None
         self._lock = threading.Lock()
+        self.last_error: Optional[str] = ZEROCONF_UNAVAILABLE_REASON
+        self.available: bool = ZEROCONF_AVAILABLE
 
     def start(self, own_ips: Optional[List[str]] = None,
-              on_change: Optional[Callable[[List[PeerInfo]], None]] = None):
-        """Start discovering NexusFlow receivers on the LAN."""
+              on_change: Optional[Callable[[List[PeerInfo]], None]] = None) -> bool:
+        """Start discovering NexusFlow receivers on the LAN.
+
+        Returns True when the browser is actually running.  Callers must check
+        the return value (or :attr:`available`) — a bare ``if discovery:`` guard
+        is always true because this is a module-level singleton.
+        """
         if not ZEROCONF_AVAILABLE:
-            print("[NSD] zeroconf not installed — device discovery disabled.")
-            return
+            self.last_error = ZEROCONF_UNAVAILABLE_REASON
+            self.available = False
+            print(f"[NSD] {self.last_error}")
+            return False
 
         with self._lock:
             self.stop_locked()
@@ -174,11 +207,22 @@ class NsdDiscovery:
                     self._listener.set_on_change(on_change)
                 self._zeroconf = Zeroconf()
                 self._browser = ServiceBrowser(self._zeroconf, SERVICE_TYPE, self._listener)
+                self.last_error = None
+                self.available = True
                 print(f"[NSD] Discovery started (own IPs: {all_own_ips})")
+                return True
             except Exception as e:
-                print(f"[NSD] Failed to start discovery: {e}")
+                self.last_error = f"{type(e).__name__}: {e}"
+                self.available = False
+                print(f"[NSD] Failed to start discovery: {self.last_error}")
                 self._zeroconf = None
                 self._browser = None
+                self._listener = None
+                return False
+
+    @property
+    def is_running(self) -> bool:
+        return self._zeroconf is not None and self._browser is not None
 
     def get_peers(self) -> List[PeerInfo]:
         with self._lock:

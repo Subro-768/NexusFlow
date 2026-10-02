@@ -10,19 +10,20 @@ import android.net.Uri
 import android.os.Environment
 import android.webkit.MimeTypeMap
 import android.widget.Toast
-import androidx.compose.animation.*
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -32,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -47,16 +49,11 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
 import com.resumabletransfer.app.R
 import com.resumabletransfer.app.server.IncomingTransferState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
-
-data class ReceivedFileInfo(
-    val file: File,
-    val name: String,
-    val size: Long,
-    val lastModified: Long
-)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -74,31 +71,37 @@ fun ReceiverScreen(
     val context = LocalContext.current
     val primaryIp = localIps.firstOrNull { !it.startsWith("127.") } ?: localIps.firstOrNull() ?: "127.0.0.1"
 
-    val qrBitmap = remember(primaryIp, isServerRunning) {
-        if (isServerRunning) generateQrCode(primaryIp, 512) else null
+    /**
+     * QR generation off the main thread.
+     *
+     * `generateQrCode` is a 512x512 per-pixel `setPixel` loop -- 262,144 JNI
+     * calls. It used to run inside `remember {}`, i.e. during composition on the
+     * UI thread, so flipping the receiver switch visibly janked (and risked an
+     * ANR). `produceState` moves it to a background dispatcher and caches the
+     * result.
+     */
+    val qrBitmap by produceState<Bitmap?>(initialValue = null, primaryIp, isServerRunning) {
+        if (!isServerRunning) {
+            value = null
+            return@produceState
+        }
+        value = withContext(Dispatchers.Default) { generateQrCode(primaryIp, 512) }
     }
 
     var receivedFiles by remember { mutableStateOf(listOf<ReceivedFileInfo>()) }
 
     fun refreshFileList() {
-        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val nexusDir = File(downloads, "NexusFlow")
-        val dir = if (nexusDir.exists()) nexusDir else context.filesDir
-        val files = dir.listFiles()?.filter { it.isFile && !it.name.startsWith(".") }
-            ?.sortedByDescending { it.lastModified() }
-            ?.map {
-                ReceivedFileInfo(
-                    file = it,
-                    name = it.name,
-                    size = it.length(),
-                    lastModified = it.lastModified()
-                )
-            } ?: emptyList()
-        receivedFiles = files
+        receivedFiles = scanReceivedFiles(context)
     }
 
+    // The scan does listFiles() + a stat per entry; it belongs on IO, not the
+    // main dispatcher. The loading flag keeps the previous "empty" text from
+    // flashing while the listing is in flight.
+    var filesLoading by remember { mutableStateOf(false) }
     LaunchedEffect(incomingState?.status) {
-        refreshFileList()
+        filesLoading = true
+        receivedFiles = withContext(Dispatchers.IO) { scanReceivedFiles(context) }
+        filesLoading = false
     }
 
     Scaffold(
@@ -148,21 +151,31 @@ fun ReceiverScreen(
                         onClick = onRefreshIp,
                         modifier = Modifier
                             .padding(end = 4.dp)
-                            .size(36.dp)
+                            .size(48.dp)
                             .clip(CircleShape)
                             .background(SoloraSurfaceElevated)
                     ) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh IP", tint = SoloraCyan, modifier = Modifier.size(20.dp))
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = stringResource(R.string.cd_refresh_ip),
+                            tint = SoloraCyan,
+                            modifier = Modifier.size(20.dp)
+                        )
                     }
                     IconButton(
                         onClick = onOpenDownloads,
                         modifier = Modifier
                             .padding(end = 8.dp)
-                            .size(36.dp)
+                            .size(48.dp)
                             .clip(CircleShape)
                             .background(SoloraSurfaceElevated)
                     ) {
-                        Icon(Icons.Default.FolderOpen, contentDescription = "Open Folder", tint = SoloraEnergyGreen, modifier = Modifier.size(20.dp))
+                        Icon(
+                            Icons.Default.FolderOpen,
+                            contentDescription = stringResource(R.string.cd_open_downloads),
+                            tint = SoloraEnergyGreen,
+                            modifier = Modifier.size(20.dp)
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -386,11 +399,19 @@ fun ReceiverScreen(
                                 .size(170.dp)
                                 .padding(4.dp)
                         ) {
-                            Image(
-                                bitmap = qrBitmap.asImageBitmap(),
-                                contentDescription = "Connection QR Code",
-                                modifier = Modifier.fillMaxSize()
-                            )
+                            // qrBitmap is a delegated property (from produceState),
+                            // so it cannot be smart-cast; bind it to a local first.
+                            val bitmap = qrBitmap
+                            if (bitmap != null) {
+                                Image(
+                                    bitmap = bitmap.asImageBitmap(),
+                                    contentDescription = stringResource(
+                                        R.string.cd_qr_code,
+                                        primaryIp
+                                    ),
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
                         }
 
                         Text(
@@ -539,7 +560,7 @@ fun ReceiverScreen(
                         }
                     }
 
-                    if (receivedFiles.isEmpty()) {
+                    if (receivedFiles.isEmpty() && !filesLoading) {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -547,18 +568,27 @@ fun ReceiverScreen(
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                "No files received yet.\nStart receiver and send files from another device.",
+                                stringResource(R.string.receiver_no_files),
                                 color = SoloraTextSecondary,
                                 fontSize = 12.sp,
                                 textAlign = TextAlign.Center,
                                 lineHeight = 18.sp
                             )
                         }
-                    } else {
+                    } else if (receivedFiles.isNotEmpty()) {
                         val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd  HH:mm", Locale.getDefault()) }
 
-                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            receivedFiles.forEach { item ->
+                        // LazyColumn so only the visible rows compose. The previous
+                        // Column { receivedFiles.forEach {} } built every row
+                        // eagerly, which grows unbounded as files accumulate.
+                        LazyColumn(
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.heightIn(max = 320.dp)
+                        ) {
+                            items(
+                                items = receivedFiles,
+                                key = { it.file.absolutePath }
+                            ) { item ->
                                 Surface(
                                     shape = RoundedCornerShape(14.dp),
                                     color = SoloraSurfaceElevated,
@@ -585,7 +615,7 @@ fun ReceiverScreen(
                                                 contentAlignment = Alignment.Center
                                             ) {
                                                 Icon(
-                                                    Icons.Default.InsertDriveFile,
+                                                    Icons.AutoMirrored.Filled.InsertDriveFile,
                                                     contentDescription = null,
                                                     tint = SoloraCyan,
                                                     modifier = Modifier.size(20.dp)
@@ -620,9 +650,13 @@ fun ReceiverScreen(
                                             ),
                                             border = BorderStroke(1.dp, SoloraEnergyGreen),
                                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                                            modifier = Modifier.height(34.dp)
+                                            modifier = Modifier.heightIn(min = 48.dp)
                                         ) {
-                                            Text("OPEN", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                            Text(
+                                                stringResource(R.string.cd_open),
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold
+                                            )
                                         }
                                     }
                                 }
@@ -635,6 +669,36 @@ fun ReceiverScreen(
             Spacer(Modifier.height(20.dp))
         }
     }
+}
+
+@androidx.compose.runtime.Immutable
+data class ReceivedFileInfo(
+    val file: File,
+    val name: String,
+    val size: Long,
+    val lastModified: Long
+)
+
+/**
+ * Lists received files. Kept out of the composable so it can be dispatched to
+ * IO: it performs a directory listing plus a `stat` per file.
+ */
+fun scanReceivedFiles(context: Context): List<ReceivedFileInfo> {
+    val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+    val nexusDir = File(downloads, "NexusFlow")
+    val dir = if (nexusDir.exists()) nexusDir else context.filesDir
+    return dir.listFiles()
+        ?.filter { it.isFile && !it.name.startsWith(".") }
+        ?.sortedByDescending { it.lastModified() }
+        ?.map {
+            ReceivedFileInfo(
+                file = it,
+                name = it.name,
+                size = it.length(),
+                lastModified = it.lastModified()
+            )
+        }
+        ?: emptyList()
 }
 
 fun openFileWithSystemViewer(context: Context, file: File) {

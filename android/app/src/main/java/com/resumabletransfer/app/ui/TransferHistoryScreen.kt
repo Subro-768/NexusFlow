@@ -17,6 +17,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import com.resumabletransfer.app.R
 import com.resumabletransfer.app.TransferApiClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -56,32 +59,23 @@ fun TransferHistoryScreen(
     }
 
     Scaffold(
-        containerColor = SoloraBgDark,
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        "SESSION ARCHIVE",
-                        fontWeight = FontWeight.Black,
-                        fontSize = 17.sp,
-                        letterSpacing = 1.5.sp,
-                        color = SoloraTextPrimary
-                    )
-                },
-                navigationIcon = {
-                    IconButton(onClick = onMenuClick) {
-                        Icon(Icons.Default.Menu, contentDescription = "Open menu", tint = SoloraTextPrimary)
-                    }
-                },
+            NexusTopBar(
+                subtitle = stringResource(R.string.nav_history),
+                onMenuClick = onMenuClick,
                 actions = {
-                    IconButton(onClick = { loadHistory() }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = SoloraNeonLime)
+                    IconButton(
+                        onClick = { loadHistory() },
+                        modifier = Modifier.size(48.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = stringResource(R.string.cd_refresh),
+                            tint = SoloraNeonLime
+                        )
                     }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = SoloraBgDark,
-                    titleContentColor = SoloraTextPrimary
-                )
+                }
             )
         }
     ) { padding ->
@@ -122,7 +116,10 @@ fun TransferHistoryScreen(
                 LazyColumn(
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    items(historyList) { item ->
+                    items(
+                        items = historyList,
+                        key = { it.transferId }
+                    ) { item ->
                         val isComplete = (item.status == "COMPLETED")
                         val pct = if (item.totalSize > 0) ((item.receivedBytes * 100) / item.totalSize).toInt() else 0
 
@@ -210,7 +207,7 @@ fun TransferHistoryScreen(
                                 if (!isComplete) {
                                     Button(
                                         onClick = { onResumeSession(item) },
-                                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                                         shape = RoundedCornerShape(10.dp),
                                         colors = ButtonDefaults.buttonColors(containerColor = SoloraNeonLime, contentColor = SoloraBgDark)
                                     ) {

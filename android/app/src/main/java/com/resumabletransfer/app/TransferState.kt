@@ -1,5 +1,7 @@
 package com.resumabletransfer.app
 
+import androidx.compose.runtime.Immutable
+
 enum class TransferStatus {
     IDLE,
     CONNECTING,
@@ -12,6 +14,16 @@ enum class TransferStatus {
     CANCELLED
 }
 
+/**
+ * Progress snapshot handed to the UI.
+ *
+ * Annotated [Immutable] because every field is a val of a stable primitive
+ * type: without it the Compose compiler treats this class as unstable, so every
+ * emission invalidates every composable that touches it. This object is
+ * re-emitted on each chunk, so that instability was costing a full-screen
+ * recomposition per chunk.
+ */
+@Immutable
 data class TransferProgress(
     val status: TransferStatus = TransferStatus.IDLE,
     val filename: String = "",
