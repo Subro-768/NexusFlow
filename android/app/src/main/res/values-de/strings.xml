@@ -89,4 +89,19 @@
     <string name="history_received">empfangen</string>
     <string name="history_file_count">%1$d Dateien</string>
     <string name="history_peer_summary">%1$d Dateien  ·  %2$s gesamt</string>
+
+    <!-- Sharesheet -->
+    <string name="share_queue_title">GETEILTE DATEIEN</string>
+    <string name="share_queue_subtitle">%1$d von %2$d bereit</string>
+    <string name="share_remove">%1$s entfernen</string>
+    <string name="share_clear_all">Alle entfernen</string>
+    <string name="share_send_all">ALLE SENDEN</string>
+    <string name="share_staged">Zwischenkopie</string>
+    <string name="msg_share_no_files">Diese Freigabe enthielt keine Dateien</string>
+    <string name="msg_share_all_failed">Die geteilte Datei konnte nicht gelesen werden. Die Berechtigung ist möglicherweise abgelaufen.</string>
+    <string name="msg_share_received">%1$d geteilte Datei(en) empfangen</string>
+    <string name="msg_share_partial">%1$d Datei(en) empfangen; %2$d nicht lesbar</string>
+    <string name="msg_share_queue_cleared">Geteilte Dateien entfernt</string>
+    <string name="msg_share_pick_device_first">Zuerst ein Empfängergerät auswählen</string>
+    <string name="msg_share_queue_done">Alle geteilten Dateien gesendet</string>
 </resources>

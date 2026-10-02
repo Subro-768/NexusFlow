@@ -61,12 +61,24 @@ private const val DEFAULT_PORT = 8000
 private const val STATE_URI = "state_selected_uri"
 private const val STATE_FILENAME = "state_selected_filename"
 private const val STATE_FILESIZE = "state_selected_filesize"
+private const val STATE_SCREEN = "state_current_screen"
+private const val STATE_SHARED_INDEX = "state_shared_index"
+private const val STATE_SHARED_URIS = "state_shared_uris"
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var transferManager: TransferManager
     private var embeddedServer: EmbeddedTransferServer? = null
     private var nsdHelper: NsdHelper? = null
+
+    /**
+     * Current top-level destination.
+     *
+     * Hoisted out of setContent because the Sharesheet handler needs to navigate
+     * to the Send screen from outside the composition -- an incoming share can
+     * arrive while the user is on the Receiver or History screen.
+     */
+    private var currentScreen by mutableStateOf(ScreenNav.TRANSFER)
 
     private var serverIp by mutableStateOf("127.0.0.1")
     private var serverPort by mutableStateOf("8000")
@@ -87,6 +99,17 @@ class MainActivity : ComponentActivity() {
 
     /** Non-null while the History screen is drilled into one device. */
     private var selectedPeerHistory by mutableStateOf<PeerHistory?>(null)
+
+    /**
+     * Files received from the Android Sharesheet, queued for sending.
+     *
+     * Held in state so the UI can list them with name/size/type and let the user
+     * drop items before starting. [sharedQueueIndex] tracks which one the
+     * progress card is currently showing; the queue itself survives rotation via
+     * rememberSaveable in the composable that renders it.
+     */
+    private var sharedFiles by mutableStateOf<List<SharedFile>>(emptyList())
+    private var sharedQueueIndex by mutableStateOf(0)
 
     /**
      * Feedback channel. Every `Toast.makeText` call in this Activity (there
@@ -226,21 +249,60 @@ class MainActivity : ComponentActivity() {
             selectedFileUri = savedInstanceState.getString(STATE_URI)?.let(Uri::parse)
             selectedFileName = savedInstanceState.getString(STATE_FILENAME)
             selectedFileSize = savedInstanceState.getLong(STATE_FILESIZE, 0L).takeIf { it > 0L }
+            currentScreen = savedInstanceState.getString(STATE_SCREEN)
+                ?.let { runCatching { ScreenNav.valueOf(it) }.getOrNull() }
+                ?: ScreenNav.TRANSFER
+            sharedQueueIndex = savedInstanceState.getInt(STATE_SHARED_INDEX, 0)
+            // Re-derive the queue from the staged files rather than trusting saved
+            // metadata: a staged file may have been reclaimed from the cache, in
+            // which case it must not be offered for sending again.
+            savedInstanceState.getStringArrayList(STATE_SHARED_URIS)?.forEach { raw ->
+                val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return@forEach
+                if (SharedFileStager.stagedFileFor(applicationContext, uri) != null) {
+                    sharedFiles = sharedFiles + SharedFileStager.describeExisting(
+                        applicationContext, uri
+                    )
+                }
+            }
         }
 
         checkNotificationPermission()
+
+        // Process a share only on a genuine cold start.
+        //
+        // onCreate also runs on every configuration change, and Android replays
+        // getIntent() there -- so calling this unconditionally re-staged the
+        // shared bytes on each rotation and stacked duplicate copies in the
+        // cache. On a recreate the queue is restored from savedInstanceState
+        // above instead, which re-attaches to the existing staged copies via
+        // stagedFileFor() rather than copying again.
+        //
+        // When the app was already running the intent arrives through
+        // onNewIntent(), which calls this directly.
+        if (savedInstanceState == null) {
+            handleShareIntent(intent)
+        }
 
         setContent {
             ResumableTransferTheme {
                 val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
                 val scope = rememberCoroutineScope()
-                var currentScreen by remember { mutableStateOf(ScreenNav.TRANSFER) }
+                // currentScreen is hoisted to the Activity (see the field above) so
+                // the Sharesheet handler can navigate without touching composition
+                // state.
                 // collectAsStateWithLifecycle stops collecting when the Activity
                 // is not STARTED. With plain collectAsState the progress flow kept
                 // driving recompositions for a backgrounded app.
                 val progress by transferManager.progressState.collectAsStateWithLifecycle()
                 val incomingTransfer by (embeddedServer?.incomingState
                     ?: remember { MutableStateFlow(null) }).collectAsStateWithLifecycle()
+
+                // When a shared file finishes successfully, move the queue on to
+                // the next one. Keyed on the status so it fires once per
+                // transition, not on every recomposition.
+                LaunchedEffect(progress.status) {
+                    maybeAdvanceSharedQueue(progress.status)
+                }
 
                 BackHandler(enabled = drawerState.isOpen || currentScreen != ScreenNav.TRANSFER) {
                     if (drawerState.isOpen) {
@@ -383,6 +445,14 @@ class MainActivity : ComponentActivity() {
                                     },
                                     onRefreshPeers = { startPeerDiscovery() },
                                     onScanQr = { showPairingCodeDialog() },
+                                    sharedFiles = sharedFiles,
+                                    sharedQueueIndex = sharedQueueIndex,
+                                    onRemoveShared = { removeSharedFile(it) },
+                                    onClearShared = {
+                                        clearSharedFiles()
+                                        notifyUser(getString(R.string.msg_share_queue_cleared))
+                                    },
+                                    onSendAllShared = { sendAllSharedFiles() },
                                     selectedFileName = if (displayName.isNotEmpty()) displayName else null,
                                     selectedFileSize = if (displaySize > 0) displaySize else null,
                                     selectedFileUri = selectedFileUri,
@@ -483,6 +553,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleNewTransfer() {
+        // A shared batch belongs to the transfer that started it; starting a new
+        // transfer by hand abandons the queue rather than leaving files staged
+        // with no way to send them.
+        if (sharedFiles.isNotEmpty()) clearSharedFiles()
         selectedFileName = null
         selectedFileSize = null
         selectedFileUri = null
@@ -656,6 +730,238 @@ class MainActivity : ComponentActivity() {
         selectedFileUri?.let { outState.putString(STATE_URI, it.toString()) }
         outState.putString(STATE_FILENAME, selectedFileName)
         outState.putLong(STATE_FILESIZE, selectedFileSize ?: 0L)
+        outState.putString(STATE_SCREEN, currentScreen.name)
+        outState.putInt(STATE_SHARED_INDEX, sharedQueueIndex)
+        outState.putStringArrayList(
+            STATE_SHARED_URIS,
+            ArrayList(sharedFiles.map { it.uri.toString() })
+        )
+    }
+
+    // ── Android Sharesheet ────────────────────────────────────────────────
+
+    /**
+     * Called when a share arrives while the app is already running.
+     *
+     * `singleTask` in the manifest routes the share to the existing instance
+     * rather than creating a second one, which is what stops a share from
+     * killing an in-flight transfer. `setIntent` keeps `getIntent()` in sync so
+     * a later configuration change does not replay a stale intent.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    /**
+     * Stages the files from a share intent and opens the Send screen with them
+     * queued.
+     *
+     * Runs on IO because staging copies the bytes; a large video shared from the
+     * Gallery would otherwise block the main thread long enough to trigger an
+     * ANR. Failures are reported per file rather than aborting the whole share.
+     */
+    private fun handleShareIntent(intent: Intent?) {
+        if (!ShareIntentParser.isShare(intent)) return
+
+        val uris = ShareIntentParser.extractUris(intent)
+        if (uris.isEmpty()) {
+            // A plain text share, or a provider that exposed nothing usable.
+            notifyUser(getString(R.string.msg_share_no_files))
+            return
+        }
+
+        val mime = ShareIntentParser.extractMime(intent)
+        ShareIntentParser.tryTakePersistable(contentResolver, intent)
+
+        lifecycleScope.launch {
+            val staged = withContext(Dispatchers.IO) {
+                SharedFileStager.stageAll(applicationContext, uris, mime)
+            }
+
+            val usable = staged.filter { it.isUsable }
+            val failed = staged.filterNot { it.isUsable }
+
+            if (usable.isEmpty()) {
+                notifyUser(getString(R.string.msg_share_all_failed))
+                return@launch
+            }
+
+            sharedFiles = usable
+            sharedQueueIndex = 0
+
+            // Land on the Send screen with the first file already selected, so
+            // the existing transfer workflow takes over from here.
+            currentScreen = ScreenNav.TRANSFER
+            handleSelectedFileFor(usable.first())
+
+            when {
+                failed.isEmpty() ->
+                    notifyUser(getString(R.string.msg_share_received, usable.size))
+                else ->
+                    notifyUser(
+                        getString(
+                            R.string.msg_share_partial,
+                            usable.size,
+                            failed.size
+                        )
+                    )
+            }
+
+            SharedFileStager.trimToBudget(applicationContext)
+        }
+    }
+
+    /** Drops a queued shared file and advances to the next one. */
+    private fun removeSharedFile(file: SharedFile) {
+        val remaining = sharedFiles.filterNot { it.uri == file.uri }
+        file.stagedFile?.delete()
+        sharedFiles = remaining
+        if (remaining.isEmpty()) {
+            sharedQueueIndex = 0
+            // Also clear the transfer session. The progress card falls back to
+            // TransferProgress.filename for display, and the persisted URI still
+            // points at the file just deleted, so nulling selectedFileName alone
+            // left a phantom entry in PAYLOAD SOURCE that could no longer be sent.
+            transferManager.clearSavedSession()
+            selectedFileUri = null
+            selectedFileName = null
+            selectedFileSize = null
+        } else {
+            sharedQueueIndex = sharedQueueIndex.coerceIn(0, remaining.size - 1)
+            handleSelectedFileFor(remaining[sharedQueueIndex])
+        }
+    }
+
+    /** Clears the whole share queue and its staged copies. */
+    private fun clearSharedFiles() {
+        sharedFiles.forEach { it.stagedFile?.delete() }
+        sharedFiles = emptyList()
+        sharedQueueIndex = 0
+        SharedFileStager.cleanupStale(applicationContext)
+    }
+
+    /**
+     * Sends the queued shared files one after another to the selected peer.
+     *
+     * Deliberately reuses the existing single-file transfer path rather than
+     * adding a second mechanism: each file goes through the same chunking,
+     * resumability, progress and SHA-256 verification as a manually picked file.
+     * The next file is started only once the previous one reaches a terminal
+     * state, so the foreground service is never asked to run two transfers at
+     * once.
+     *
+     * Nothing is sent until the user picks a peer, matching the manual flow.
+     */
+    private fun sendAllSharedFiles() {
+        val pending = sharedFiles
+        if (pending.isEmpty()) return
+
+        val host = serverIp.trim()
+        if (host.isEmpty() || host == "127.0.0.1" && !isConnected) {
+            notifyUser(getString(R.string.msg_share_pick_device_first))
+            return
+        }
+        val url = "http://$host:${serverPort.trim()}"
+        sharedQueueIndex = 0
+        startSharedNext(url, pending)
+    }
+
+    /**
+     * Starts the queued file at [sharedQueueIndex], or clears the queue when the
+     * last one has finished.
+     */
+    private fun startSharedNext(url: String, queue: List<SharedFile>) {
+        val index = sharedQueueIndex
+        val file = queue.getOrNull(index)
+        if (file == null || file.stagedFile == null || !file.stagedFile!!.exists()) {
+            // Nothing usable left; drop the finished entries and stop.
+            finishSharedQueue()
+            return
+        }
+
+        selectedFileUri = Uri.fromFile(file.stagedFile)
+        selectedFileName = file.name
+        selectedFileSize = file.sizeBytes
+
+        val serviceIntent = Intent(this, TransferForegroundService::class.java).apply {
+            action = TransferForegroundService.ACTION_START
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+
+        transferManager.startTransfer(
+            serverUrl = url,
+            uri = requireNotNull(selectedFileUri),
+            filename = file.name,
+            fileSize = file.sizeBytes,
+            peerDisplayName = selectedPeerName
+        )
+    }
+
+    /**
+     * Removes the file that just finished and starts the next one, if any.
+     *
+     * The next transfer is kicked off here rather than only re-selecting it, so
+     * a shared batch actually sends every file. Falls back to the queue staying
+     * staged for manual sending if the peer is somehow no longer set.
+     */
+    private fun finishSharedQueue() {
+        val done = sharedFiles.getOrNull(sharedQueueIndex)
+        done?.stagedFile?.delete()
+        sharedFiles = sharedFiles.filterIndexed { i, _ -> i != sharedQueueIndex }
+
+        if (sharedFiles.isEmpty()) {
+            sharedQueueIndex = 0
+            SharedFileStager.cleanupStale(applicationContext)
+            notifyUser(getString(R.string.msg_share_queue_done))
+            return
+        }
+
+        sharedQueueIndex = sharedQueueIndex.coerceAtMost(sharedFiles.size - 1)
+        val host = serverIp.trim()
+        val canContinue = host.isNotEmpty() && (host != "127.0.0.1" || isConnected)
+        if (canContinue) {
+            startSharedNext("http://$host:${serverPort.trim()}", sharedFiles)
+        } else {
+            // No usable target: surface the next file so the user can pick one.
+            handleSelectedFileFor(sharedFiles[sharedQueueIndex])
+        }
+    }
+
+    /**
+     * Advances the shared queue when a transfer it started reaches a terminal
+     * state. A no-op when the current file did not come from a share, so the
+     * manual single-file flow is unaffected.
+     */
+    private fun maybeAdvanceSharedQueue(status: TransferStatus) {
+        if (sharedFiles.isEmpty()) return
+        if (status !in setOf(
+                TransferStatus.COMPLETED,
+                TransferStatus.FAILED,
+                TransferStatus.CANCELLED
+            )
+        ) return
+        // Only auto-advance on success: a failure should stop and let the user
+        // resume or cancel deliberately rather than silently moving on.
+        if (status != TransferStatus.COMPLETED) return
+        val current = selectedFileUri ?: return
+        val expected = sharedFiles.getOrNull(sharedQueueIndex)?.stagedFile ?: return
+        if (Uri.fromFile(expected) != current) return
+        finishSharedQueue()
+    }
+
+    /** Selects a staged shared file through the normal file-selection path. */
+    private fun handleSelectedFileFor(file: SharedFile) {
+        val staged = file.stagedFile
+        if (staged == null || !staged.exists()) {
+            removeSharedFile(file)
+            return
+        }
+        selectedFileUri = Uri.fromFile(staged)
+        selectedFileName = file.name
+        selectedFileSize = file.sizeBytes
+        transferManager.saveFileSelection(Uri.fromFile(staged), file.name, file.sizeBytes)
     }
 
     override fun onDestroy() {

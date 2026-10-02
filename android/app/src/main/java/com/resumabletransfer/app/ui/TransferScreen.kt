@@ -42,6 +42,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -54,6 +55,8 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
@@ -99,6 +102,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.resumabletransfer.app.PeerDevice
 import com.resumabletransfer.app.R
+import com.resumabletransfer.app.SharedFile
 import com.resumabletransfer.app.TransferProgress
 import com.resumabletransfer.app.TransferStatus
 
@@ -114,6 +118,11 @@ fun TransferScreen(
     onRefreshPeers: () -> Unit = {},
     onScanQr: () -> Unit = {},
     isDiscovering: Boolean = false,
+    sharedFiles: List<SharedFile> = emptyList(),
+    sharedQueueIndex: Int = 0,
+    onRemoveShared: (SharedFile) -> Unit = {},
+    onClearShared: () -> Unit = {},
+    onSendAllShared: () -> Unit = {},
     selectedFileName: String?,
     selectedFileSize: Long?,
     selectedFileUri: Uri?,
@@ -161,6 +170,16 @@ fun TransferScreen(
                 selectedFileSize = selectedFileSize,
                 onPickFile = onPickFile
             )
+
+            if (sharedFiles.isNotEmpty()) {
+                SharedFileQueueCard(
+                    files = sharedFiles,
+                    currentIndex = sharedQueueIndex,
+                    onRemove = onRemoveShared,
+                    onClearAll = onClearShared,
+                    onSendAll = onSendAllShared
+                )
+            }
 
             PeerDiscoveryPanel(
                 discoveredPeers = discoveredPeers,
@@ -751,6 +770,172 @@ private fun SectionHeader(
             style = MaterialTheme.typography.labelMedium,
             color = SoloraTextSecondary
         )
+    }
+}
+
+/**
+ * Files received from the Android Sharesheet, queued for sending.
+ *
+ * Only rendered when a share is pending, so the normal single-file flow is
+ * untouched. Each row shows name, size and MIME type, and can be removed
+ * individually before anything is sent -- the staged copy is deleted with it.
+ */
+@Composable
+private fun SharedFileQueueCard(
+    files: List<SharedFile>,
+    currentIndex: Int,
+    onRemove: (SharedFile) -> Unit,
+    onClearAll: () -> Unit,
+    onSendAll: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = SoloraSurfaceCard,
+        border = BorderStroke(1.dp, SoloraEnergyGreen.copy(alpha = 0.35f))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SectionHeader(
+                    icon = { tint ->
+                        Icon(
+                            Icons.Default.Share,
+                            contentDescription = null,
+                            tint = tint,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    },
+                    title = stringResource(R.string.share_queue_title),
+                    tint = SoloraEnergyGreen
+                )
+                Text(
+                    stringResource(
+                        R.string.share_queue_subtitle,
+                        (currentIndex + 1).coerceAtMost(files.size),
+                        files.size
+                    ),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SoloraTextMuted
+                )
+            }
+
+            files.forEachIndexed { index, file ->
+                val isCurrent = index == currentIndex
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                    color = if (isCurrent) {
+                        SoloraEnergyGreen.copy(alpha = 0.10f)
+                    } else {
+                        SoloraSurfaceElevated
+                    },
+                    border = if (isCurrent) {
+                        BorderStroke(1.dp, SoloraEnergyGreen.copy(alpha = 0.5f))
+                    } else {
+                        null
+                    }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(
+                            start = 12.dp, end = 4.dp,
+                            top = 10.dp, bottom = 10.dp
+                        ),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            if (isCurrent) Icons.Default.ArrowUpward
+                            else Icons.AutoMirrored.Filled.InsertDriveFile,
+                            contentDescription = null,
+                            tint = if (isCurrent) SoloraEnergyGreen else SoloraCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                file.name,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = SoloraTextPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                "${formatFileSize(file.sizeBytes)}  ·  ${file.mimeType}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SoloraTextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        IconButton(
+                            onClick = { onRemove(file) },
+                            modifier = Modifier.size(MinTouchTarget)
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = stringResource(
+                                    R.string.share_remove,
+                                    file.name
+                                ),
+                                tint = SoloraTextSecondary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onClearAll,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp),
+                    shape = MaterialTheme.shapes.small,
+                    border = BorderStroke(1.dp, SoloraBorder)
+                ) {
+                    Text(
+                        stringResource(R.string.share_clear_all),
+                        color = SoloraTextSecondary,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
+                Button(
+                    onClick = onSendAll,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp),
+                    shape = MaterialTheme.shapes.small,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SoloraNeonLime,
+                        contentColor = SoloraTextOnAccent
+                    )
+                ) {
+                    Icon(
+                        Icons.Default.Send,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        stringResource(R.string.share_send_all),
+                        fontWeight = FontWeight.Black,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+        }
     }
 }
 
