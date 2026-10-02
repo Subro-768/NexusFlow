@@ -1,0 +1,1663 @@
+import sys
+import os
+import io
+import time
+import socket
+import threading
+import json
+import subprocess
+import re
+import qrcode
+from PIL import Image, ImageQt
+from datetime import datetime
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QFileDialog, QProgressBar, QStackedWidget,
+    QFrame, QLineEdit, QScrollArea, QGraphicsDropShadowEffect, QMessageBox,
+    QSizePolicy, QSpacerItem, QSpinBox, QCheckBox
+)
+from PyQt6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QBrush, QPen, QCursor
+
+# Import transfer_client and embedded_server
+try:
+    from transfer_client import LinuxTransferClient
+    from embedded_server import EmbeddedReceiverServer
+    from nsd_helper import advertiser as nsd_advertiser, discovery as nsd_discovery, ZEROCONF_AVAILABLE
+except ImportError:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    from desktop.transfer_client import LinuxTransferClient
+    from desktop.embedded_server import EmbeddedReceiverServer
+    try:
+        from desktop.nsd_helper import advertiser as nsd_advertiser, discovery as nsd_discovery, ZEROCONF_AVAILABLE
+    except ImportError:
+        nsd_advertiser = None
+        nsd_discovery = None
+        ZEROCONF_AVAILABLE = False
+
+# ─── Palette ──────────────────────────────────────────────────────────────────
+SOLORA_BG               = "#090C10"
+SOLORA_SURFACE          = "#121824"
+SOLORA_SURFACE_CARD     = "#151C28"
+SOLORA_SURFACE_ELEVATED = "#1A2232"
+SOLORA_BORDER           = "#232D40"
+SOLORA_NEON_LIME        = "#D4FF00"
+SOLORA_ENERGY_GREEN     = "#00E599"
+SOLORA_CYAN             = "#00D4FF"
+SOLORA_AMBER            = "#FFB703"
+SOLORA_ALERT_RED        = "#FF4D4D"
+SOLORA_TEXT_PRIMARY     = "#F8FAFC"
+SOLORA_TEXT_SECONDARY   = "#94A3B8"
+SOLORA_TEXT_MUTED       = "#64748B"
+
+DRAWER_WIDTH = 260
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_history.json")
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def format_size(v):
+    if v < 1024:      return f"{v} B"
+    if v < 1024**2:   return f"{v/1024:.1f} KB"
+    if v < 1024**3:   return f"{v/1024**2:.2f} MB"
+    return f"{v/1024**3:.2f} GB"
+
+def get_local_ips():
+    ips = []
+    # 1. Probe network interfaces using 'ip route get' to find real default gateway interface
+    try:
+        out = subprocess.check_output(["ip", "route", "get", "1.1.1.1"], text=True)
+        m = re.search(r"src\s+([0-9.]+)", out)
+        if m:
+            ip = m.group(1)
+            if not ip.startswith("127.") and not ip.startswith("172.16.") and not ip.startswith("10.8."):
+                ips.append(ip)
+    except Exception:
+        pass
+        
+    # 2. Probe physical network interfaces via 'ip -4 -br addr'
+    try:
+        out = subprocess.check_output(["ip", "-4", "-br", "addr"], text=True)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                iface, state, addr_cidr = parts[0], parts[1], parts[2]
+                if not iface.startswith(("lo", "docker", "virbr", "Cloudflare", "wg", "tun")):
+                    ip = addr_cidr.split("/")[0]
+                    if ip not in ips and not ip.startswith("127."):
+                        ips.append(ip)
+    except Exception:
+        pass
+
+    # 3. Fallback to UDP socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if not ip.startswith("127.") and not ip.startswith("172.16.") and ip not in ips:
+            ips.append(ip)
+    except Exception:
+        pass
+
+    # 4. Fallback to hostname
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if not ip.startswith("127.") and not ip.startswith("172.16.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+
+    return ips if ips else ["127.0.0.1"]
+
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE) as f: return json.load(f)
+    except Exception: pass
+    return []
+
+def save_history_entry(entry):
+    h = load_history()
+    # Check if duplicate entry already at top
+    h = [x for x in h if not (x.get("transfer_id") == entry.get("transfer_id") and x.get("filename") == entry.get("filename"))]
+    h.insert(0, entry)
+    h = h[:100]
+    try:
+        with open(HISTORY_FILE, "w") as f: json.dump(h, f, indent=2)
+    except Exception: pass
+
+RECENT_IPS_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_recent_ips.json")
+
+def load_recent_ips():
+    try:
+        if os.path.exists(RECENT_IPS_FILE):
+            with open(RECENT_IPS_FILE) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return [str(ip).strip() for ip in data if str(ip).strip()]
+    except Exception:
+        pass
+    # Fallback to scanning history for target_ips
+    try:
+        h = load_history()
+        ips = []
+        for x in h:
+            raw_ip = str(x.get("target_ip", "")).strip()
+            # Extract plain IP if it has text like "Received from 10.3.207.215"
+            match = re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", raw_ip)
+            clean_ip = match.group(0) if match else raw_ip
+            if clean_ip and clean_ip not in ips and clean_ip != "127.0.0.1":
+                ips.append(clean_ip)
+        return ips
+    except Exception:
+        return []
+
+def save_recent_ip(ip: str):
+    ip = ip.strip()
+    if not ip:
+        return
+    current = load_recent_ips()
+    if ip in current:
+        current.remove(ip)
+    current.insert(0, ip)
+    current = current[:20]
+    try:
+        with open(RECENT_IPS_FILE, "w") as f:
+            json.dump(current, f, indent=2)
+    except Exception:
+        pass
+
+
+DEVICE_NAME_FILE = os.path.join(os.path.expanduser("~"), ".nexusflow_device_name.txt")
+
+def load_device_name() -> str:
+    try:
+        if os.path.exists(DEVICE_NAME_FILE):
+            with open(DEVICE_NAME_FILE) as f:
+                name = f.read().strip()
+                if name:
+                    return name
+    except Exception:
+        pass
+    return socket.gethostname()
+
+def save_device_name(name: str):
+    try:
+        with open(DEVICE_NAME_FILE, "w") as f:
+            f.write(name.strip())
+    except Exception:
+        pass
+
+def open_file_or_dir(filepath: str):
+    """Open file or folder with system default viewer."""
+    try:
+        if sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", filepath])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", filepath])
+        elif sys.platform == "win32":
+            os.startfile(filepath)
+    except Exception:
+        pass
+
+
+# ─── Transfer Worker ──────────────────────────────────────────────────────────
+class TransferWorker(QThread):
+    progress_signal  = pyqtSignal(int, int, float, float)
+    status_signal    = pyqtSignal(str, str)
+    completed_signal = pyqtSignal(dict)
+    error_signal     = pyqtSignal(str)
+
+    def __init__(self, client, filepath, existing_transfer_id=None):
+        super().__init__()
+        self.client = client
+        self.filepath = filepath
+        self.existing_transfer_id = existing_transfer_id
+
+    def run(self):
+        try:
+            self.status_signal.emit("Connecting", "Validating connection with target device...")
+            self.client.test_connection()
+            self.status_signal.emit("Hashing", "Computing cryptographic SHA-256...")
+            checksum = self.client.calculate_sha256(self.filepath)
+            transfer_id = self.existing_transfer_id
+            start_offset = 0
+            if transfer_id:
+                self.status_signal.emit("Reconnecting", f"Checking resume offset for {transfer_id}...")
+                start_offset = self.client.get_status(transfer_id).get("received_bytes", 0)
+            else:
+                self.status_signal.emit("Initializing", "Negotiating transfer session...")
+                sess = self.client.create_transfer(self.filepath, checksum=checksum)
+                transfer_id = sess["transfer_id"]
+            self.status_signal.emit("Transferring", f"Streaming from byte {start_offset}...")
+            res = self.client.send_file(
+                filepath=self.filepath, transfer_id=transfer_id, start_offset=start_offset,
+                progress_callback=lambda c,t,s,e: self.progress_signal.emit(c,t,s,e)
+            )
+            self.completed_signal.emit(res)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
+# ─── Nav Drawer ───────────────────────────────────────────────────────────────
+class NavDrawer(QWidget):
+    nav_clicked = pyqtSignal(int)
+
+    NAV_ITEMS = [
+        ("\u2191", "Sender Mode"),
+        ("\u2193", "Receiver Hub (P2P)"),
+        ("\u23F1", "Transfer History"),
+        ("\u2699", "Settings"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(DRAWER_WIDTH)
+        self.current_index = 0
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.setStyleSheet(f"background: {SOLORA_SURFACE}; border-right: 1px solid {SOLORA_BORDER};")
+
+        # Logo header
+        header = QWidget()
+        header.setFixedHeight(88)
+        header.setStyleSheet(f"background: {SOLORA_SURFACE};")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(16, 12, 16, 12)
+        hl.setSpacing(12)
+
+        logo_lbl = QLabel()
+        logo_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "android", "app", "src", "main", "res", "drawable", "ic_nexus_flow.png"
+        )
+        if os.path.exists(logo_path):
+            pix = QPixmap(logo_path).scaled(38, 38, Qt.AspectRatioMode.KeepAspectRatio,
+                                             Qt.TransformationMode.SmoothTransformation)
+            logo_lbl.setPixmap(pix)
+        else:
+            logo_lbl.setText("◈")
+            logo_lbl.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: 20pt;")
+        logo_lbl.setFixedSize(42, 42)
+        hl.addWidget(logo_lbl)
+
+        tc = QVBoxLayout(); tc.setSpacing(2)
+        lbl_n = QLabel("<span style='color:#00D4FF; font-weight:900;'>NEXUS </span>"
+                       "<span style='color:#00E599; font-weight:900;'>FLOW</span>")
+        lbl_n.setStyleSheet("font-size: 14pt;")
+        lbl_s = QLabel("SMART FILE TRANSFER")
+        lbl_s.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 7pt; font-weight: bold; letter-spacing: 2px;")
+        tc.addWidget(lbl_n); tc.addWidget(lbl_s)
+        hl.addLayout(tc)
+        layout.addWidget(header)
+
+        # Divider
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"color: {SOLORA_BORDER}; background: {SOLORA_BORDER}; max-height: 1px;")
+        layout.addWidget(div)
+        layout.addSpacing(8)
+
+        # Nav buttons
+        self.nav_buttons = []
+        for i, (icon, label) in enumerate(self.NAV_ITEMS):
+            btn = QPushButton(f"  {icon}   {label}")
+            btn.setCheckable(True)
+            btn.setFixedHeight(48)
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            btn.setStyleSheet(self._btn_style(False))
+            btn.clicked.connect(lambda _, idx=i: self._on_nav(idx))
+            self.nav_buttons.append(btn)
+            layout.addWidget(btn)
+            layout.addSpacing(2)
+
+        self.nav_buttons[0].setChecked(True)
+        self.nav_buttons[0].setStyleSheet(self._btn_style(True))
+        layout.addStretch()
+
+        # Footer
+        footer = QWidget()
+        footer.setStyleSheet(f"background: {SOLORA_SURFACE}; border-top: 1px solid {SOLORA_BORDER};")
+        fl = QVBoxLayout(footer); fl.setContentsMargins(14, 10, 14, 10); fl.setSpacing(2)
+        fl.addWidget(QLabel("NEXUS FLOW v1.0  —  Linux Desktop"))
+        proto = QLabel("Protocol: Resumable HTTP/1.1 + SHA-256")
+        proto.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 7pt;")
+        fl.addWidget(proto)
+        layout.addWidget(footer)
+
+    def _btn_style(self, active):
+        if active:
+            return (f"QPushButton {{ background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_CYAN}; "
+                    f"border: none; border-left: 3px solid {SOLORA_CYAN}; border-radius: 0px; "
+                    f"text-align: left; padding-left: 14px; font-weight: bold; font-size: 10pt; }}")
+        return (f"QPushButton {{ background: transparent; color: {SOLORA_TEXT_SECONDARY}; "
+                f"border: none; border-left: 3px solid transparent; border-radius: 0px; "
+                f"text-align: left; padding-left: 14px; font-size: 10pt; }}"
+                f"QPushButton:hover {{ background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_TEXT_PRIMARY}; }}")
+
+    def _on_nav(self, idx):
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setChecked(i == idx)
+            btn.setStyleSheet(self._btn_style(i == idx))
+        self.current_index = idx
+        self.nav_clicked.emit(idx)
+
+    def set_active(self, idx):
+        self._on_nav(idx)
+
+
+# ─── Sender Screen ────────────────────────────────────────────────────────────
+class SenderScreen(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected_file = None
+        self.active_worker = None
+        self.active_client = None
+        self.active_transfer_id = None
+        self._build()
+
+        # Start NSD discovery and refresh UI every 2 seconds
+        if nsd_discovery:
+            own_ips = get_local_ips()
+            nsd_discovery.start(own_ips=own_ips, on_change=lambda peers: self.refresh_nearby_devices_ui())
+        self._discovery_timer = QTimer(self)
+        self._discovery_timer.timeout.connect(self.refresh_nearby_devices_ui)
+        self._discovery_timer.start(2000)
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("SENDER MODE")
+        title.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: 11pt; font-weight: bold; letter-spacing: 2px;")
+        layout.addWidget(title)
+
+        # Connection card
+        cc = QFrame(); cc.setObjectName("card")
+        cc.setStyleSheet(f"""
+            QFrame#card {{
+                background-color: {SOLORA_SURFACE_CARD};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 14px;
+            }}
+            QLabel {{
+                background-color: transparent;
+            }}
+            QWidget {{
+                background-color: transparent;
+            }}
+            QLineEdit {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                color: {SOLORA_NEON_LIME};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-family: monospace;
+                font-size: 10pt;
+            }}
+            QPushButton {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                color: {SOLORA_TEXT_PRIMARY};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 8px;
+                padding: 6px 14px;
+                font-weight: bold;
+                font-size: 9pt;
+            }}
+            QPushButton:hover {{
+                border-color: {SOLORA_CYAN};
+                color: {SOLORA_CYAN};
+            }}
+        """)
+        cl = QVBoxLayout(cc); cl.setContentsMargins(18,16,18,16); cl.setSpacing(12)
+
+        # ── Nearby Devices Discovery Panel ──
+        nearby_frame = QFrame()
+        nearby_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                border: 1px solid rgba(0, 212, 255, 0.3);
+                border-radius: 10px;
+            }}
+            QLabel {{ background: transparent; }}
+        """)
+        nf_layout = QVBoxLayout(nearby_frame)
+        nf_layout.setContentsMargins(12, 10, 12, 10)
+        nf_layout.setSpacing(8)
+
+        nearby_title_row = QHBoxLayout()
+        lbl_nearby = QLabel("⬡  NEARBY DEVICES")
+        lbl_nearby.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; letter-spacing: 1px;")
+        self.lbl_scanning = QLabel("● Scanning...")
+        self.lbl_scanning.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt;")
+        nearby_title_row.addWidget(lbl_nearby)
+        nearby_title_row.addStretch()
+        nearby_title_row.addWidget(self.lbl_scanning)
+
+        # Refresh nearby devices button
+        btn_refresh_nearby = QPushButton("⟳")
+        btn_refresh_nearby.setFixedSize(28, 28)
+        btn_refresh_nearby.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_refresh_nearby.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_CYAN}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: 8pt;")
+        btn_refresh_nearby.setToolTip("Refresh nearby devices")
+        btn_refresh_nearby.clicked.connect(self.refresh_nearby_devices_ui)
+        nearby_title_row.addWidget(btn_refresh_nearby)
+
+        # QR scanner button (for quick pairing)
+        btn_qr_scan = QPushButton("📷")
+        btn_qr_scan.setFixedSize(28, 28)
+        btn_qr_scan.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_qr_scan.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_NEON_LIME}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: 8pt;")
+        btn_qr_scan.setToolTip("Scan QR code from receiver device")
+        btn_qr_scan.clicked.connect(self.scan_qr_from_receiver)
+        nearby_title_row.addWidget(btn_qr_scan)
+        nf_layout.addLayout(nearby_title_row)
+
+        self.nearby_devices_container = QWidget()
+        self.nearby_devices_container.setStyleSheet("background: transparent;")
+        self.nearby_devices_layout = QHBoxLayout(self.nearby_devices_container)
+        self.nearby_devices_layout.setContentsMargins(0, 0, 0, 0)
+        self.nearby_devices_layout.setSpacing(8)
+
+        nearby_scroll = QScrollArea()
+        nearby_scroll.setFixedHeight(64)
+        nearby_scroll.setWidgetResizable(True)
+        nearby_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        nearby_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nearby_scroll.setStyleSheet(f"""
+            QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollBar:horizontal {{
+                height: 6px;
+                background: rgba(255,255,255,0.03);
+                border-radius: 3px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: rgba(0,212,255,0.5);
+                min-width: 24px;
+                border-radius: 3px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: rgba(0,212,255,0.8);
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px; background: none;
+            }}
+        """)
+        nearby_scroll.setWidget(self.nearby_devices_container)
+        nf_layout.addWidget(nearby_scroll)
+        cl.addWidget(nearby_frame)
+
+        # Manual entry row (collapsed/hidden by default - nearby devices is primary)
+        # Kept for edge cases but not prominent
+        manual_row_label = QLabel("▼  MANUAL IP ENTRY (fallback)")
+        manual_row_label.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; letter-spacing: 1px;")
+        manual_row_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        manual_row_label.mousePressEvent = lambda e: self._toggle_manual_entry()
+        cl.addWidget(manual_row_label)
+
+        self.manual_entry_widget = QWidget()
+        self.manual_entry_widget.setVisible(False)
+        manual_layout = QVBoxLayout(self.manual_entry_widget)
+        manual_layout.setContentsMargins(0, 8, 0, 0)
+        manual_layout.setSpacing(8)
+
+        top_conn = QHBoxLayout(); top_conn.setSpacing(10)
+        lbl_t = QLabel("DEVICE NAME:")
+        lbl_t.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; background: transparent;")
+        # Show discovered device name (primary selection via nearby devices panel)
+        self.txt_peer_name = QLineEdit(""); self.txt_peer_name.setFixedWidth(150)
+        lbl_p = QLabel("PORT:")
+        lbl_p.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-weight: bold; font-size: 9pt; background: transparent;")
+        self.txt_port = QLineEdit("8000"); self.txt_port.setFixedWidth(70)
+        self.btn_test = QPushButton("TEST CONNECTION"); self.btn_test.clicked.connect(self.test_connection)
+        self.lbl_conn = QLabel("● Ready")
+        self.lbl_conn.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-weight: bold; background: transparent;")
+        for w in [lbl_t, self.txt_peer_name, lbl_p, self.txt_port, self.btn_test]:
+            top_conn.addWidget(w)
+        top_conn.addSpacing(10); top_conn.addWidget(self.lbl_conn); top_conn.addStretch()
+        manual_layout.addLayout(top_conn)
+
+        # Faded Recent IP History Row / Scrollbar area
+        self.recent_ips_container = QWidget()
+        self.recent_ips_container.setStyleSheet("background: transparent;")
+        self.recent_ips_layout = QHBoxLayout(self.recent_ips_container)
+        self.recent_ips_layout.setContentsMargins(0, 0, 0, 0)
+        self.recent_ips_layout.setSpacing(6)
+
+        recent_scroll = QScrollArea()
+        recent_scroll.setFixedHeight(36)
+        recent_scroll.setWidgetResizable(True)
+        recent_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        recent_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        recent_scroll.setStyleSheet(f"""
+            QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
+                background: transparent;
+                border: none;
+            }}
+            QScrollBar:horizontal {{
+                height: 4px;
+                background: rgba(255, 255, 255, 0.03);
+                margin: 0px;
+                border-radius: 2px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: rgba(100, 116, 139, 0.35);
+                min-width: 24px;
+                border-radius: 2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: rgba(0, 212, 255, 0.6);
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                width: 0px;
+                background: none;
+            }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: none;
+            }}
+        """)
+        recent_scroll.setWidget(self.recent_ips_container)
+
+        recent_header = QHBoxLayout(); recent_header.setSpacing(8)
+        lbl_recent_tag = QLabel("RECENT:")
+        lbl_recent_tag.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; letter-spacing: 1px; background: transparent;")
+        recent_header.addWidget(lbl_recent_tag)
+        recent_header.addWidget(recent_scroll, 1)
+        manual_layout.addLayout(recent_header)
+
+        cl.addWidget(self.manual_entry_widget)
+
+        layout.addWidget(cc)
+        self.refresh_recent_ips_ui()
+        self.refresh_nearby_devices_ui()
+
+        # Progress card
+        pc = QFrame(); pc.setObjectName("card")
+        pl = QVBoxLayout(pc); pl.setContentsMargins(20,20,20,20); pl.setSpacing(12)
+        top = QHBoxLayout()
+        self.lbl_file = QLabel("NO FILE SELECTED")
+        self.lbl_file.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: 14pt; font-weight: bold;")
+        self.lbl_badge = QLabel("STANDBY")
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_TEXT_SECONDARY}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        top.addWidget(self.lbl_file); top.addStretch(); top.addWidget(self.lbl_badge)
+        pl.addLayout(top)
+        self.prog_bar = QProgressBar()
+        self.prog_bar.setRange(0,100); self.prog_bar.setValue(0)
+        self.prog_bar.setFixedHeight(14); self.prog_bar.setTextVisible(False)
+        pl.addWidget(self.prog_bar)
+        mr = QHBoxLayout()
+        self.lbl_vol   = QLabel("0 B / 0 B (0%)")
+        self.lbl_vol.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: monospace; font-size: 10pt;")
+        self.lbl_speed = QLabel("0 KB/s")
+        self.lbl_speed.setStyleSheet(f"color: {SOLORA_NEON_LIME}; font-weight: bold; font-family: monospace; font-size: 10pt;")
+        self.lbl_eta   = QLabel("ETA: --")
+        self.lbl_eta.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: monospace; font-size: 10pt;")
+        mr.addWidget(self.lbl_vol); mr.addStretch()
+        mr.addWidget(self.lbl_speed); mr.addSpacing(16); mr.addWidget(self.lbl_eta)
+        pl.addLayout(mr)
+
+        # Status / Log banner with modern styling
+        log_box = QFrame()
+        log_box.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(26, 34, 50, 0.7);
+                border: 1px solid rgba(0, 212, 255, 0.25);
+                border-radius: 8px;
+            }}
+        """)
+        lbl_box_layout = QHBoxLayout(log_box)
+        lbl_box_layout.setContentsMargins(14, 9, 14, 9)
+        lbl_box_layout.setSpacing(10)
+
+        self.lbl_log_dot = QLabel("●")
+        self.lbl_log_dot.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 11pt; background: transparent;")
+        self.lbl_log = QLabel("Ready to initiate high-speed data transfer.")
+        self.lbl_log.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: 9.5pt; font-weight: 600; letter-spacing: 0.5px; background: transparent;")
+        lbl_box_layout.addWidget(self.lbl_log_dot)
+        lbl_box_layout.addWidget(self.lbl_log, 1)
+        pl.addWidget(log_box)
+        layout.addWidget(pc)
+
+        # Buttons
+        br = QHBoxLayout()
+        self.btn_pick = QPushButton("SELECT FILE FROM DISK"); self.btn_pick.setFixedHeight(46)
+        self.btn_pick.clicked.connect(self.pick_file)
+        self.btn_start = QPushButton("▶  START TRANSFER"); self.btn_start.setFixedHeight(46)
+        self.btn_start.setEnabled(False)
+        self.btn_start.setStyleSheet(f"background-color: {SOLORA_NEON_LIME}; color: {SOLORA_BG}; font-weight: bold; border-radius: 10px;")
+        self.btn_start.clicked.connect(self.start_or_resume)
+        self.btn_pause = QPushButton("⏸  PAUSE"); self.btn_pause.setFixedHeight(46); self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self.pause_transfer)
+        self.btn_cancel = QPushButton("✖  CANCEL"); self.btn_cancel.setFixedHeight(46); self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self.cancel_transfer)
+        br.addWidget(self.btn_pick, 2); br.addWidget(self.btn_start, 3)
+        br.addWidget(self.btn_pause, 1); br.addWidget(self.btn_cancel, 1)
+        layout.addLayout(br)
+        layout.addStretch()
+
+    def _toggle_manual_entry(self):
+        """Toggle visibility of manual IP entry section."""
+        is_visible = self.manual_entry_widget.isVisible()
+        self.manual_entry_widget.setVisible(not is_visible)
+        label_text = "▲  MANUAL IP ENTRY (fallback)" if not is_visible else "▼  MANUAL IP ENTRY (fallback)"
+        # Update the label text
+        for child in self.findChildren(QLabel):
+            if "MANUAL IP ENTRY" in child.text() or "MANUAL ENTRY" in child.text():
+                child.setText(label_text)
+                break
+
+    def scan_qr_from_receiver(self):
+        """Launch camera/QR scanner to read receiver device pairing code."""
+        # On Linux desktop: prompt user to use phone/camera to scan receiver QR
+        # The receiver broadcasts its device name via NSD; scanning QR connects instantly
+        QMessageBox.information(
+            self, "QR Pairing",
+            "Point your camera at the receiver device's pairing screen.\n"
+            "When the device name appears in 'Nearby Devices', tap it to connect."
+        )
+        # Trigger nearby device refresh after prompt
+        self.refresh_nearby_devices_ui()
+
+    def refresh_recent_ips_ui(self):
+        while self.recent_ips_layout.count() > 0:
+            item = self.recent_ips_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        recent_ips = load_recent_ips()
+        if not recent_ips:
+            lbl_none = QLabel("No saved target IPs yet")
+            lbl_none.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-style: italic;")
+            self.recent_ips_layout.addWidget(lbl_none)
+        else:
+            for ip in recent_ips:
+                btn_ip = QPushButton(ip)
+                btn_ip.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                btn_ip.setFixedHeight(26)
+                btn_ip.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {SOLORA_SURFACE_ELEVATED};
+                        color: {SOLORA_CYAN};
+                        border: 1px solid {SOLORA_BORDER};
+                        border-radius: 6px;
+                        padding: 2px 10px;
+                        font-family: monospace;
+                        font-size: 8.5pt;
+                        font-weight: bold;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {SOLORA_BORDER};
+                        border-color: {SOLORA_CYAN};
+                        color: {SOLORA_ENERGY_GREEN};
+                    }}
+                """)
+                btn_ip.clicked.connect(lambda _, target=ip: self.select_recent_ip(target))
+                self.recent_ips_layout.addWidget(btn_ip)
+
+        self.recent_ips_layout.addStretch()
+
+    def select_recent_ip(self, ip: str):
+        self.txt_peer_name.setText(ip)
+        self.test_connection()
+
+    def select_peer(self, host: str, port: int, name: str):
+        """Called when user clicks a discovered nearby device button."""
+        self.txt_peer_name.setText(host)
+        self.txt_port.setText(str(port))
+        self.test_connection()
+
+    def refresh_nearby_devices_ui(self):
+        """Refresh the nearby devices panel from current NSD discovery results."""
+        # Clear old buttons
+        while self.nearby_devices_layout.count() > 0:
+            item = self.nearby_devices_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        peers = nsd_discovery.get_peers() if nsd_discovery else []
+        current_ip = self.txt_peer_name.text().strip()
+
+        if not peers:
+            # Empty state with guidance
+            empty_container = QWidget()
+            empty_container.setStyleSheet("background: transparent;")
+            empty_layout = QVBoxLayout(empty_container)
+            empty_layout.setContentsMargins(8, 8, 8, 8)
+            empty_layout.setSpacing(6)
+
+            lbl_none = QLabel("No devices found on this Wi-Fi")
+            lbl_none.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 9pt; font-weight: bold;")
+            lbl_none.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_layout.addWidget(lbl_none)
+
+            lbl_hint = QLabel("Enable 'Receiving' on the target device to appear here")
+            lbl_hint.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt;")
+            lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_layout.addWidget(lbl_hint)
+
+            self.nearby_devices_layout.addWidget(empty_container)
+
+            self.lbl_scanning.setText("● Scanning...")
+            self.lbl_scanning.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt;")
+        else:
+            self.lbl_scanning.setText(f"● {len(peers)} device(s) found")
+            self.lbl_scanning.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 8pt; font-weight: bold;")
+
+            for peer in peers:
+                is_selected = peer.host == current_ip
+
+                # Create a card-like widget for each peer
+                peer_card = QFrame()
+                peer_card.setFixedHeight(52)
+                peer_card.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                sel_color = SOLORA_ENERGY_GREEN if is_selected else SOLORA_CYAN
+                peer_card.setStyleSheet(f"""
+                    QFrame {{
+                        background-color: {'rgba(0,229,153,0.12)' if is_selected else SOLORA_SURFACE_CARD};
+                        border: 1px solid {sel_color};
+                        border-radius: 10px;
+                    }}
+                    QFrame:hover {{
+                        background-color: rgba(0, 212, 255, 0.15);
+                        border-color: {SOLORA_CYAN};
+                    }}
+                    QLabel {{ background: transparent; }}
+                """)
+
+                card_layout = QHBoxLayout(peer_card)
+                card_layout.setContentsMargins(12, 8, 12, 8)
+                card_layout.setSpacing(10)
+
+                # Device icon
+                icon_lbl = QLabel("📱")
+                icon_lbl.setStyleSheet(f"font-size: 16pt; color: {sel_color}; background: transparent;")
+                icon_lbl.setFixedSize(32, 32)
+                card_layout.addWidget(icon_lbl)
+
+                # Device info
+                info_layout = QVBoxLayout()
+                info_layout.setSpacing(1)
+
+                name_lbl = QLabel(peer.name)
+                name_lbl.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY if not is_selected else sel_color}; font-weight: bold; font-size: 10pt; background: transparent;")
+                info_layout.addWidget(name_lbl)
+
+                ip_port_lbl = QLabel(f"{peer.host}:{peer.port}")
+                ip_port_lbl.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-family: monospace; font-size: 7.5pt; background: transparent;")
+                info_layout.addWidget(ip_port_lbl)
+
+                card_layout.addLayout(info_layout)
+                card_layout.addStretch()
+
+                # Selected indicator
+                if is_selected:
+                    check_lbl = QLabel("✓")
+                    check_lbl.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: 14pt; background: transparent;")
+                    check_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    check_lbl.setFixedWidth(24)
+                    card_layout.addWidget(check_lbl)
+
+                # Make the whole card clickable
+                peer_card.mousePressEvent = lambda e, h=peer.host, p=peer.port, n=peer.name: self.select_peer(h, p, n)
+
+                self.nearby_devices_layout.addWidget(peer_card)
+
+        self.nearby_devices_layout.addStretch()
+
+    def test_connection(self):
+        ip = self.txt_peer_name.text().strip(); port = self.txt_port.text().strip()
+        client = LinuxTransferClient(f"http://{ip}:{port}")
+        self.lbl_conn.setText("● Testing..."); self.lbl_conn.setStyleSheet(f"color: {SOLORA_AMBER}; font-weight: bold;")
+        QApplication.processEvents()
+        try:
+            res = client.test_connection()
+            self.lbl_conn.setText(f"● Connected ({res.get('service','ok')})")
+            self.lbl_conn.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold;")
+            if ip and ip != "127.0.0.1":
+                save_recent_ip(ip)
+                self.refresh_recent_ips_ui()
+        except Exception:
+            self.lbl_conn.setText("● Unreachable"); self.lbl_conn.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold;")
+
+    def pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select File to Stream", os.path.expanduser("~"))
+        if path:
+            self.selected_file = path; self.active_transfer_id = None
+            sz = os.path.getsize(path)
+            self.lbl_file.setText(os.path.basename(path))
+            self.lbl_vol.setText(f"0 B / {format_size(sz)} (0%)")
+            self.lbl_log.setText(f"Ready to transfer {os.path.basename(path)} ({format_size(sz)})")
+            self.btn_start.setEnabled(True); self.prog_bar.setValue(0)
+
+    def start_or_resume(self):
+        if not self.selected_file: return
+        ip = self.txt_peer_name.text().strip(); port = self.txt_port.text().strip()
+        if ip and ip != "127.0.0.1":
+            save_recent_ip(ip)
+            self.refresh_recent_ips_ui()
+        self.active_client = LinuxTransferClient(f"http://{ip}:{port}")
+        self.btn_start.setEnabled(False); self.btn_pick.setEnabled(False)
+        self.btn_pause.setEnabled(True); self.btn_cancel.setEnabled(True)
+        self.active_worker = TransferWorker(self.active_client, self.selected_file, self.active_transfer_id)
+        self.active_worker.progress_signal.connect(self.on_progress)
+        self.active_worker.status_signal.connect(self.on_status)
+        self.active_worker.completed_signal.connect(self.on_completed)
+        self.active_worker.error_signal.connect(self.on_error)
+        self.active_worker.start()
+
+    def pause_transfer(self):
+        if self.active_client: self.active_client.is_paused = True
+        self.lbl_badge.setText("PAUSED")
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_AMBER}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_log.setText("Transfer paused. Byte offset preserved.")
+        self.btn_pause.setEnabled(False); self.btn_start.setText("▶  RESUME"); self.btn_start.setEnabled(True)
+
+    def cancel_transfer(self):
+        if self.active_client: self.active_client.is_cancelled = True
+        self.lbl_badge.setText("CANCELLED")
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_ALERT_RED}; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
+        self.btn_start.setText("▶  START TRANSFER"); self.btn_start.setEnabled(True); self.btn_pick.setEnabled(True)
+
+    def on_progress(self, curr, total, spd, eta):
+        pct = int((curr/total)*100) if total > 0 else 0
+        self.prog_bar.setValue(pct)
+        self.lbl_vol.setText(f"{format_size(curr)} / {format_size(total)} ({pct}%)")
+        self.lbl_speed.setText(f"{format_size(int(spd))}/s")
+        self.lbl_eta.setText(f"ETA: {int(eta)}s" if eta < 3600 else "ETA: >1h")
+
+    def on_status(self, badge, msg):
+        self.lbl_badge.setText(badge.upper())
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_CYAN}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_log.setText(msg)
+
+    def on_completed(self, res):
+        self.lbl_badge.setText("COMPLETED")
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        sha = res.get("calculated_sha256", "")
+        self.lbl_log.setText(f"✓ Transfer Complete! SHA-256: {sha[:16]}...")
+        self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
+        self.btn_start.setEnabled(True); self.btn_start.setText("▶  START TRANSFER"); self.btn_pick.setEnabled(True)
+        save_history_entry({
+            "filename": os.path.basename(self.selected_file),
+            "size": os.path.getsize(self.selected_file),
+            "sha256": sha, "status": "completed",
+            "timestamp": datetime.now().isoformat(),
+            "transfer_id": res.get("transfer_id",""),
+            "target_ip": self.txt_peer_name.text().strip(),
+            "direction": "sent",
+            "file_path": self.selected_file
+        })
+        QMessageBox.information(self, "Success", "File transfer completed and cryptographically verified!")
+
+    def on_error(self, err):
+        self.lbl_badge.setText("INTERRUPTED")
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_ALERT_RED}; color: white; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_log.setText(f"⚠ Interrupted: {err}. Progress saved — tap Resume when ready.")
+        self.btn_pause.setEnabled(False); self.btn_start.setText("▶  RESUME")
+        self.btn_start.setEnabled(True); self.btn_pick.setEnabled(True)
+
+    def resume_from_history(self, entry):
+        self.active_transfer_id = entry.get("transfer_id")
+        self.txt_peer_name.setText(entry.get("target_ip", "127.0.0.1"))
+        self.lbl_file.setText(entry.get("filename", "Unknown"))
+        self.lbl_badge.setText("RESUMING")
+        self.lbl_badge.setStyleSheet(f"background: {SOLORA_AMBER}; color: {SOLORA_BG}; padding: 4px 10px; border-radius: 6px; font-weight: bold;")
+        self.lbl_log.setText(f"Resuming session {self.active_transfer_id}...")
+        path, _ = QFileDialog.getOpenFileName(self, f"Re-select: {entry.get('filename','')}", os.path.expanduser("~"))
+        if path:
+            self.selected_file = path
+            self.btn_start.setEnabled(True); self.btn_start.setText("▶  RESUME")
+
+
+# ─── Receiver Screen ──────────────────────────────────────────────────────────
+class ReceiverScreen(QWidget):
+    ip_updated_signal = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.server = EmbeddedReceiverServer(host="0.0.0.0", port=8000)
+        self._device_name = load_device_name()
+        self._build()
+
+    def _build(self):
+        # Wrap everything in a main scroll area so long file lists scroll smoothly
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+        
+        # 1. Top Bar
+        top_row = QHBoxLayout()
+        title = QLabel("RECEIVER HUB (P2P)")
+        title.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 11pt; font-weight: bold; letter-spacing: 2px;")
+        top_row.addWidget(title)
+        top_row.addStretch()
+        
+
+        self.btn_toggle_server = QPushButton("⚡  ENABLE RECEIVING")
+        self.btn_toggle_server.setFixedHeight(38)
+        self.btn_toggle_server.setMinimumWidth(170)
+        self.btn_toggle_server.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_toggle_server.setStyleSheet(f"background-color: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; font-weight: bold; border-radius: 8px;")
+        self.btn_toggle_server.clicked.connect(self.toggle_server)
+        top_row.addWidget(self.btn_toggle_server)
+        layout.addLayout(top_row)
+
+        # 2. Connection / Endpoint Card
+        card = QFrame(); card.setObjectName("card")
+        cl = QVBoxLayout(card); cl.setContentsMargins(20,18,20,18); cl.setSpacing(12)
+
+        # Device Name section (always visible)
+        lbl_device_name_header = QLabel("DEVICE NAME  —  Nearby senders will see this name instead of your IP")
+        lbl_device_name_header.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; letter-spacing: 1px;")
+        cl.addWidget(lbl_device_name_header)
+
+        name_row = QHBoxLayout(); name_row.setSpacing(8)
+        self.txt_device_name = QLineEdit(self._device_name)
+        self.txt_device_name.setPlaceholderText(f"e.g. {socket.gethostname()}")
+        self.txt_device_name.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                color: {SOLORA_TEXT_PRIMARY};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 8px;
+                padding: 7px 12px;
+                font-size: 11pt;
+                font-weight: bold;
+            }}
+            QLineEdit:focus {{ border-color: {SOLORA_CYAN}; }}
+        """)
+        self.txt_device_name.textChanged.connect(self._on_device_name_changed)
+        name_row.addWidget(self.txt_device_name, 1)
+        cl.addLayout(name_row)
+
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"color: {SOLORA_BORDER}; background: {SOLORA_BORDER}; max-height: 1px;")
+        cl.addWidget(div)
+
+
+        status_row = QHBoxLayout()
+        lbl_h = QLabel("INCOMING ENDPOINT — DEVICE B MODE")
+        lbl_h.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: 10pt; letter-spacing: 1px;")
+        status_row.addWidget(lbl_h)
+        status_row.addStretch()
+
+        self.lbl_server_status = QLabel("● SERVER OFFLINE")
+        self.lbl_server_status.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold; font-size: 9pt;")
+        status_row.addWidget(self.lbl_server_status)
+        cl.addLayout(status_row)
+
+        # Show device name + port when enabled (instead of IP)
+        self.lbl_broadcast_status = QLabel("Not broadcasting")
+        self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 9pt;")
+        cl.addWidget(self.lbl_broadcast_status)
+
+        # Subtle IP hint (collapsible)
+        self.ip_hint_label = QLabel("▼  Show local IP (for manual entry)")
+        self.ip_hint_label.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; letter-spacing: 1px;")
+        self.ip_hint_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.ip_hint_label.mousePressEvent = lambda e: self._toggle_ip_hint()
+        cl.addWidget(self.ip_hint_label)
+
+        self.ip_hint_widget = QWidget()
+        self.ip_hint_widget.setVisible(False)
+        ip_hint_layout = QVBoxLayout(self.ip_hint_widget)
+        ip_hint_layout.setContentsMargins(0, 8, 0, 0)
+        ip_hint_layout.setSpacing(4)
+
+        ips = get_local_ips()
+        self.current_ip = ips[0] if ips else "127.0.0.1"
+        self.lbl_endpoint = QLabel(f"Local Endpoint:  <span style='color:{SOLORA_NEON_LIME}; font-size:11pt; font-family:monospace;'><b>http://{self.current_ip}:8000</b></span>")
+        self.lbl_endpoint.setWordWrap(True)
+        ip_hint_layout.addWidget(self.lbl_endpoint)
+
+        self.lbl_more_ips = QLabel("  Also: " + "  |  ".join(f"http://{x}:8000" for x in ips[1:])) if len(ips) > 1 else QLabel("")
+        self.lbl_more_ips.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-family: monospace;")
+        ip_hint_layout.addWidget(self.lbl_more_ips)
+
+        cl.addWidget(self.ip_hint_widget)
+
+        qr_row = QHBoxLayout()
+        self.lbl_qr = QLabel()
+        self.lbl_qr.setStyleSheet("background: white; padding: 6px; border-radius: 8px;")
+        self.lbl_qr.setFixedSize(160,160)
+        self.update_qr(f"http://{self.current_ip}:8000")
+        qr_row.addWidget(self.lbl_qr)
+
+        qr_row.addSpacing(16)
+        desc = QVBoxLayout()
+        desc.addWidget(QLabel(f"<b style='color:{SOLORA_CYAN};'>QUICK PAIRING:</b>"))
+
+        self.lbl_step2 = QLabel(f"2. On sender device, tap your device name: <b>{self._device_name}</b> (no IP needed).")
+        self.lbl_step2.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 9pt;")
+        self.lbl_step2.setWordWrap(True)
+
+        for s in [
+            "1. Click <b>⚡ ENABLE RECEIVING</b> above (No manual terminal needed).",
+        ]:
+            l = QLabel(s); l.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 9pt;"); l.setWordWrap(True)
+            desc.addWidget(l)
+        desc.addWidget(self.lbl_step2)
+        for s in [
+            "3. Sender will auto-discover you on this Wi-Fi.",
+            f"4. Incoming files save to: <b>{self.server.upload_dir}</b>",
+        ]:
+            l = QLabel(s); l.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 9pt;"); l.setWordWrap(True)
+            desc.addWidget(l)
+        desc.addStretch()
+        qr_row.addLayout(desc); qr_row.addStretch()
+        cl.addLayout(qr_row)
+        layout.addWidget(card)
+        
+        # 3. Live Payload Monitor Card
+        self.payload_card = QFrame()
+        self.payload_card.setObjectName("card")
+        pl = QVBoxLayout(self.payload_card)
+        pl.setContentsMargins(18, 16, 18, 16)
+        pl.setSpacing(10)
+        
+        pl_top = QHBoxLayout()
+        pl_title = QLabel("LIVE INCOMING PAYLOAD STREAM")
+        pl_title.setStyleSheet(f"color: {SOLORA_CYAN}; font-weight: bold; font-size: 9pt; letter-spacing: 1px;")
+        
+        self.lbl_rx_status_badge = QLabel("STANDBY")
+        self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+        
+        pl_top.addWidget(pl_title)
+        pl_top.addStretch()
+        pl_top.addWidget(self.lbl_rx_status_badge)
+        pl.addLayout(pl_top)
+
+        self.lbl_rx_filename = QLabel("No active incoming stream")
+        self.lbl_rx_filename.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-weight: bold; font-size: 11pt;")
+        pl.addWidget(self.lbl_rx_filename)
+
+        # Progress bar (Themed Energy Green)
+        self.rx_prog_bar = QProgressBar()
+        self.rx_prog_bar.setRange(0, 100)
+        self.rx_prog_bar.setValue(0)
+        self.rx_prog_bar.setFixedHeight(12)
+        self.rx_prog_bar.setTextVisible(False)
+        self.rx_prog_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 6px;
+            }}
+            QProgressBar::chunk {{
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {SOLORA_CYAN}, stop:1 {SOLORA_ENERGY_GREEN});
+                border-radius: 5px;
+            }}
+        """)
+        pl.addWidget(self.rx_prog_bar)
+
+        # Stats row: Bytes / Total (Pct%) on left, Transfer Speed on right
+        stats_row = QHBoxLayout()
+        self.lbl_rx_vol = QLabel("0 B / 0 B (0%)")
+        self.lbl_rx_vol.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: monospace; font-size: 9.5pt;")
+        
+        self.lbl_rx_speed = QLabel("0 KB/s")
+        self.lbl_rx_speed.setStyleSheet(f"color: {SOLORA_NEON_LIME}; font-weight: bold; font-family: monospace; font-size: 9.5pt;")
+        
+        stats_row.addWidget(self.lbl_rx_vol)
+        stats_row.addStretch()
+        stats_row.addWidget(self.lbl_rx_speed)
+        pl.addLayout(stats_row)
+
+        self.lbl_payload_info = QLabel("Waiting for incoming connection stream...")
+        self.lbl_payload_info.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8.5pt; font-family: monospace;")
+        pl.addWidget(self.lbl_payload_info)
+        layout.addWidget(self.payload_card)
+
+        # 4. Received Files Area
+        recv_header = QHBoxLayout()
+        lbl_recv_title = QLabel("RECEIVED FILES")
+        lbl_recv_title.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-weight: bold; font-size: 11pt; letter-spacing: 1px;")
+        recv_header.addWidget(lbl_recv_title)
+        recv_header.addStretch()
+
+        btn_open_folder = QPushButton("📁  OPEN UPLOAD FOLDER")
+        btn_open_folder.setFixedHeight(34)
+        btn_open_folder.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; padding: 4px 12px; font-weight: bold; font-size: 8.5pt;")
+        btn_open_folder.clicked.connect(lambda: open_file_or_dir(self.server.upload_dir))
+        recv_header.addWidget(btn_open_folder)
+
+        btn_refresh_files = QPushButton("⟳  REFRESH")
+        btn_refresh_files.setFixedHeight(34)
+        btn_refresh_files.setStyleSheet(f"color: {SOLORA_CYAN}; border: 1px solid {SOLORA_CYAN}; border-radius: 6px; padding: 4px 12px; font-weight: bold; font-size: 8.5pt;")
+        btn_refresh_files.clicked.connect(self.refresh_received_files)
+        recv_header.addWidget(btn_refresh_files)
+        layout.addLayout(recv_header)
+
+        # Received files list container
+        self.files_container = QFrame()
+        self.files_container.setObjectName("card")
+        self.files_layout = QVBoxLayout(self.files_container)
+        self.files_layout.setContentsMargins(14, 12, 14, 12)
+        self.files_layout.setSpacing(8)
+        layout.addWidget(self.files_container)
+
+        layout.addStretch()
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+        
+        # Auto connect callback
+        self.server.state_callback = self.on_server_state_update
+        self.refresh_received_files()
+
+    def refresh_ip(self):
+        ips = get_local_ips()
+        self.current_ip = ips[0] if ips else "127.0.0.1"
+        self.lbl_endpoint.setText(f"Local Endpoint:  <span style='color:{SOLORA_NEON_LIME}; font-size:13pt; font-family:monospace;'><b>http://{self.current_ip}:8000</b></span>")
+        if len(ips) > 1:
+            self.lbl_more_ips.setText("  Also: " + "  |  ".join(f"http://{x}:8000" for x in ips[1:]))
+        else:
+            self.lbl_more_ips.setText("")
+        # Update pairing instructions without IP reference
+        self.lbl_step2.setText(f"2. Tap your device name <b>{self._device_name}</b> on the sender device (auto-discovered).")
+        # Hide endpoint/IP text when not needed
+        self.lbl_endpoint.setText("")
+        self.lbl_more_ips.setText("")
+        # Keep QR code but don't reference IP in text
+        self.update_qr(f"nexus://receive/{self._device_name}")
+        self.ip_updated_signal.emit(self.current_ip)
+
+    def refresh_received_files(self):
+        """Scan upload directory and list all received files with open action."""
+        while self.files_layout.count() > 0:
+            item = self.files_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        upload_dir = self.server.upload_dir
+        if not os.path.exists(upload_dir):
+            os.makedirs(upload_dir, exist_ok=True)
+
+        files = sorted(os.listdir(upload_dir), key=lambda f: os.path.getmtime(os.path.join(upload_dir, f)), reverse=True)
+        files = [f for f in files if not f.startswith(".")]
+
+        if not files:
+            empty_lbl = QLabel("No files received yet.\nStart server and send a payload from Device A to receive files here.")
+            empty_lbl.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 9pt;")
+            empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_lbl.setContentsMargins(12, 18, 12, 18)
+            self.files_layout.addWidget(empty_lbl)
+            return
+
+        for fname in files:
+            fpath = os.path.join(upload_dir, fname)
+            sz = os.path.getsize(fpath)
+            mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d  %H:%M:%S")
+
+            row_card = QFrame()
+            row_card.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; border: 1px solid {SOLORA_BORDER}; border-radius: 8px;")
+            rl = QHBoxLayout(row_card)
+            rl.setContentsMargins(12, 10, 12, 10)
+            rl.setSpacing(12)
+
+            file_icon = QLabel("📄")
+            file_icon.setStyleSheet("font-size: 16pt;")
+            rl.addWidget(file_icon)
+
+            info_col = QVBoxLayout()
+            info_col.setSpacing(2)
+            
+            lbl_name = QLabel(fname)
+            lbl_name.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-weight: bold; font-size: 9.5pt;")
+            lbl_meta = QLabel(f"{format_size(sz)}   ·   Received: {mtime}")
+            lbl_meta.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-family: monospace;")
+            
+            info_col.addWidget(lbl_name)
+            info_col.addWidget(lbl_meta)
+            rl.addLayout(info_col)
+            rl.addStretch()
+
+            btn_open = QPushButton("▶  OPEN FILE")
+            btn_open.setFixedHeight(32)
+            btn_open.setStyleSheet(f"background-color: {SOLORA_SURFACE_CARD}; color: {SOLORA_ENERGY_GREEN}; border: 1px solid {SOLORA_ENERGY_GREEN}; border-radius: 6px; padding: 4px 10px; font-weight: bold; font-size: 8.5pt;")
+            btn_open.clicked.connect(lambda _, p=fpath: open_file_or_dir(p))
+            rl.addWidget(btn_open)
+
+            btn_show_folder = QPushButton("📂")
+            btn_show_folder.setFixedSize(32, 32)
+            btn_show_folder.setToolTip("Show in file manager")
+            btn_show_folder.setStyleSheet(f"background-color: {SOLORA_SURFACE_CARD}; color: {SOLORA_TEXT_SECONDARY}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-size: 10pt;")
+            btn_show_folder.clicked.connect(lambda _, p=upload_dir: open_file_or_dir(p))
+            rl.addWidget(btn_show_folder)
+
+            self.files_layout.addWidget(row_card)
+
+    def update_qr(self, text):
+        try:
+            buf = io.BytesIO(); qrcode.make(text).save(buf, "PNG")
+            pix = QPixmap(); pix.loadFromData(buf.getvalue())
+            pix = pix.scaled(150,150,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation)
+            self.lbl_qr.setPixmap(pix)
+        except Exception:
+            pass
+
+    def _on_device_name_changed(self, text: str):
+        """Called when user edits the device name field."""
+        self._device_name = text.strip()
+        save_device_name(self._device_name)
+
+    def toggle_server(self):
+        if not self.server.is_running:
+            success = self.server.start()
+            if success:
+                # Register NSD service with device name so senders can discover this PC
+                name = self.txt_device_name.text().strip() or socket.gethostname()
+                self._device_name = name
+                if nsd_advertiser:
+                    nsd_advertiser.start(device_name=name, port=8000)
+                self.txt_device_name.setEnabled(False)
+                self.btn_toggle_server.setText("⏹  STOP RECEIVING")
+                self.btn_toggle_server.setStyleSheet(f"background-color: {SOLORA_ALERT_RED}; color: white; font-weight: bold; border-radius: 8px;")
+                self.lbl_server_status.setText(f"● BROADCASTING AS: {name}")
+                self.lbl_server_status.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-weight: bold; font-size: 9pt;")
+                self.lbl_broadcast_status.setText(f"Broadcasting as \"{name}\" on port 8000 — Discoverable on this Wi-Fi")
+                self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: 9pt; font-weight: bold;")
+                self.lbl_payload_info.setText(f"Listening on http://0.0.0.0:8000 — Discoverable as '{name}' on this Wi-Fi.")
+                # Update QR code pairing instruction
+                self.lbl_step2.setText(f"2. On sender device, tap your device name: <b>{name}</b> (no IP needed).")
+            else:
+                QMessageBox.critical(self, "Error", "Failed to start server. Port 8000 may already be in use.")
+        else:
+            self.server.stop()
+            if nsd_advertiser:
+                nsd_advertiser.stop()
+            self.txt_device_name.setEnabled(True)
+            self.btn_toggle_server.setText("⚡  ENABLE RECEIVING")
+            self.btn_toggle_server.setStyleSheet(f"background-color: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; font-weight: bold; border-radius: 8px;")
+            self.lbl_server_status.setText("● RECEIVING DISABLED")
+            self.lbl_server_status.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold; font-size: 9pt;")
+            self.lbl_broadcast_status.setText("Not broadcasting")
+            self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 9pt;")
+            self.lbl_payload_info.setText("Server stopped. Not discoverable.")
+            # Reset QR code pairing instruction
+            self.lbl_step2.setText(f"2. On sender device, tap your device name: <b>{self._device_name}</b> (no IP needed).")
+
+    def _toggle_ip_hint(self):
+        """Toggle visibility of IP hint section."""
+        is_visible = self.ip_hint_widget.isVisible()
+        self.ip_hint_widget.setVisible(not is_visible)
+        label_text = "▲  Hide local IP" if not is_visible else "▼  Show local IP (for manual entry)"
+        self.ip_hint_label.setText(label_text)
+
+    def on_server_state_update(self, rec: dict):
+        fname = rec.get("filename", "")
+        recv = rec.get("received_bytes", 0)
+        tot = rec.get("total_size", 0)
+        pct = int((recv / tot * 100)) if tot > 0 else 0
+        stat = rec.get("status", "pending")
+        speed = rec.get("speed_bytes_sec", 0)
+        sha = rec.get("calculated_sha256")
+        
+        self.lbl_rx_filename.setText(fname if fname else "Incoming stream...")
+        self.rx_prog_bar.setValue(pct)
+        self.lbl_rx_vol.setText(f"{format_size(recv)} / {format_size(tot)} ({pct}%)")
+        self.lbl_rx_speed.setText(f"{format_size(int(speed))}/s" if stat != "completed" else "0 KB/s")
+        
+        if stat == "completed":
+            self.lbl_rx_status_badge.setText("COMPLETED")
+            self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+            msg = f"✓ Completed! {fname} ({format_size(tot)})"
+            if sha:
+                msg += f"  ·  SHA-256: {sha[:16]}..."
+            self.lbl_payload_info.setText(msg)
+            self.refresh_received_files()
+        elif stat == "in_progress":
+            self.lbl_rx_status_badge.setText("RECEIVING")
+            self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_CYAN}; color: {SOLORA_BG}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+            self.lbl_payload_info.setText(f"Streaming chunks into {fname}...")
+        else:
+            self.lbl_rx_status_badge.setText(stat.upper())
+            self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+            self.lbl_payload_info.setText(f"Session initialized for {fname}.")
+
+
+# ─── History Screen ───────────────────────────────────────────────────────────
+class HistoryScreen(QWidget):
+    resume_requested = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28,24,28,24); layout.setSpacing(16)
+
+        top = QHBoxLayout()
+        title = QLabel("TRANSFER HISTORY")
+        title.setStyleSheet(f"color: {SOLORA_AMBER}; font-size: 11pt; font-weight: bold; letter-spacing: 2px;")
+        top.addWidget(title); top.addStretch()
+        br = QPushButton("⟳  REFRESH"); br.setFixedWidth(120); br.clicked.connect(self.refresh)
+        bc = QPushButton("✖  CLEAR ALL"); bc.setFixedWidth(120); bc.clicked.connect(self.clear_all)
+        top.addWidget(br); top.addWidget(bc)
+        layout.addLayout(top)
+
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.list_widget = QWidget()
+        self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setContentsMargins(0,0,0,0); self.list_layout.setSpacing(8)
+        self.scroll.setWidget(self.list_widget)
+        layout.addWidget(self.scroll)
+        self.refresh()
+
+    def refresh(self):
+        # Clear all existing widgets
+        while self.list_layout.count() > 0:
+            item = self.list_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+            
+        history = load_history()
+        if not history:
+            lbl = QLabel("No transfer history yet.\nCompleted transfers (Sent & Received) will appear here.")
+            lbl.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 10pt;"); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setContentsMargins(0, 40, 0, 0)
+            self.list_layout.addWidget(lbl)
+            self.list_layout.addStretch()
+            return
+            
+        for entry in history:
+            self.list_layout.addWidget(self._make_card(entry))
+        self.list_layout.addStretch()
+
+    def _make_card(self, entry):
+        card = QFrame(); card.setObjectName("card")
+        row = QHBoxLayout(card); row.setContentsMargins(16,12,16,12); row.setSpacing(12)
+        
+        status = entry.get("status","?")
+        direction = entry.get("direction", "sent")
+        color = SOLORA_ENERGY_GREEN if status == "completed" else SOLORA_ALERT_RED
+        
+        icon_lbl = QLabel("↓" if direction == "received" else "↑")
+        icon_lbl.setStyleSheet(f"color: {SOLORA_CYAN if direction == 'received' else SOLORA_NEON_LIME}; font-size: 14pt; font-weight: bold;")
+        icon_lbl.setFixedWidth(20)
+        row.addWidget(icon_lbl)
+        
+        info = QVBoxLayout(); info.setSpacing(2)
+        fname = QLabel(entry.get("filename","Unknown"))
+        fname.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-weight: bold; font-size: 10.5pt;")
+        
+        ts = entry.get("timestamp","")[:19].replace("T","  ")
+        dir_tag = "RECEIVED" if direction == "received" else "SENT"
+        meta = QLabel(f"[{dir_tag}]  {format_size(entry.get('size',0))}   ·   {ts}   ·   {entry.get('target_ip','?')}")
+        meta.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8pt; font-family: monospace;")
+        
+        sha = entry.get("sha256","")
+        sha_lbl = QLabel(f"SHA-256: {sha[:24]}..." if sha else "SHA-256: Verified")
+        sha_lbl.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 7.5pt; font-family: monospace;")
+        
+        info.addWidget(fname); info.addWidget(meta); info.addWidget(sha_lbl)
+        row.addLayout(info); row.addStretch()
+        
+        fpath = entry.get("file_path")
+        if fpath and os.path.exists(fpath):
+            btn_open = QPushButton("▶  OPEN FILE")
+            btn_open.setFixedHeight(32)
+            btn_open.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; border: 1px solid {SOLORA_ENERGY_GREEN}; border-radius: 6px; padding: 4px 10px; font-weight: bold; font-size: 8.5pt;")
+            btn_open.clicked.connect(lambda _, p=fpath: open_file_or_dir(p))
+            row.addWidget(btn_open)
+        elif entry.get("transfer_id") and direction == "sent":
+            btn = QPushButton("▶  RESUME"); btn.setFixedWidth(100)
+            btn.setStyleSheet(f"color: {SOLORA_NEON_LIME}; border: 1px solid {SOLORA_NEON_LIME}; border-radius: 8px; padding: 4px 8px; font-weight: bold;")
+            btn.clicked.connect(lambda _, e=entry: self.resume_requested.emit(e))
+            row.addWidget(btn)
+            
+        return card
+
+    def clear_all(self):
+        try:
+            with open(HISTORY_FILE,"w") as f: json.dump([],f)
+        except Exception: pass
+        self.refresh()
+
+
+# ─── Settings Screen ──────────────────────────────────────────────────────────
+class SettingsScreen(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28,24,28,24); layout.setSpacing(16)
+        title = QLabel("SETTINGS")
+        title.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 11pt; font-weight: bold; letter-spacing: 2px;")
+        layout.addWidget(title)
+
+        def section(lbl):
+            l = QLabel(lbl); l.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: 9pt; font-weight: bold; letter-spacing: 1px; margin-top: 8px;")
+            layout.addWidget(l)
+
+        def card_row(label, widget):
+            card = QFrame(); card.setObjectName("card")
+            row = QHBoxLayout(card); row.setContentsMargins(16,12,16,12)
+            lbl = QLabel(label); lbl.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: 10pt;")
+            row.addWidget(lbl); row.addStretch(); row.addWidget(widget)
+            layout.addWidget(card)
+
+        section("TRANSFER")
+        self.chunk_spin = QSpinBox(); self.chunk_spin.setRange(64,4096); self.chunk_spin.setValue(512); self.chunk_spin.setSuffix(" KB"); self.chunk_spin.setFixedWidth(120)
+        card_row("Chunk Size", self.chunk_spin)
+        self.verify_check = QCheckBox(); self.verify_check.setChecked(True)
+        card_row("Verify SHA-256 on completion", self.verify_check)
+
+        section("NETWORK")
+        self.port_input = QLineEdit("8000"); self.port_input.setFixedWidth(120)
+        card_row("Default Port", self.port_input)
+        self.timeout_spin = QSpinBox(); self.timeout_spin.setRange(5,120); self.timeout_spin.setValue(30); self.timeout_spin.setSuffix(" s"); self.timeout_spin.setFixedWidth(120)
+        card_row("Connection Timeout", self.timeout_spin)
+
+        section("ABOUT")
+        about = QFrame(); about.setObjectName("card")
+        ab = QVBoxLayout(about); ab.setContentsMargins(16,14,16,14); ab.setSpacing(4)
+        for line, col in [
+            ("NEXUS FLOW  —  Smart Resumable File Transfer", SOLORA_TEXT_PRIMARY),
+            ("Version 1.0  ·  Linux Desktop (PyQt6)", SOLORA_TEXT_SECONDARY),
+            ("Protocol: Resumable HTTP/1.1 chunked streaming + SHA-256 integrity", SOLORA_TEXT_MUTED),
+            ("Supports: Android ↔ Linux ↔ Linux cross-platform transfers", SOLORA_TEXT_MUTED),
+        ]:
+            l = QLabel(line); l.setStyleSheet(f"color: {col}; font-size: 9pt;"); l.setWordWrap(True); ab.addWidget(l)
+        layout.addWidget(about)
+        layout.addStretch()
+
+
+# ─── Main Window ──────────────────────────────────────────────────────────────
+class NexusFlowLinuxApp(QMainWindow):
+    PAGE_TITLES = ["Sender Mode", "Receiver Hub (P2P)", "Transfer History", "Settings"]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("NEXUS FLOW — Smart Resumable File Transfer")
+        self.resize(1080, 720)
+        self.setMinimumSize(860, 620)
+
+        logo_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "android", "app", "src", "main", "res", "drawable", "ic_nexus_flow.png"
+        )
+        if os.path.exists(logo_path):
+            self.setWindowIcon(QIcon(logo_path))
+
+        self.drawer_open = True
+        self._init_ui()
+        self._apply_styles()
+
+    def _init_ui(self):
+        root = QWidget(); root.setObjectName("centralRoot"); self.setCentralWidget(root)
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0,0,0,0); root_layout.setSpacing(0)
+
+        # Drawer
+        self.drawer = NavDrawer()
+        self.drawer.nav_clicked.connect(self._on_nav)
+        root_layout.addWidget(self.drawer)
+
+        # Right side
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0,0,0,0); right_layout.setSpacing(0)
+
+        # Top bar
+        topbar = QWidget(); topbar.setFixedHeight(50)
+        topbar.setStyleSheet(f"background: {SOLORA_SURFACE}; border-bottom: 1px solid {SOLORA_BORDER};")
+        tb = QHBoxLayout(topbar); tb.setContentsMargins(12,0,20,0); tb.setSpacing(12)
+
+        self.btn_ham = QPushButton("☰"); self.btn_ham.setFixedSize(36,36)
+        self.btn_ham.setStyleSheet(f"""QPushButton {{ background: transparent; color: {SOLORA_TEXT_PRIMARY};
+            border: none; font-size: 18pt; border-radius: 6px; }}
+            QPushButton:hover {{ background: {SOLORA_SURFACE_ELEVATED}; }}""")
+        self.btn_ham.clicked.connect(self._toggle_drawer)
+        tb.addWidget(self.btn_ham)
+
+        self.lbl_page = QLabel("Sender Mode")
+        self.lbl_page.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: 11pt; font-weight: bold;")
+        tb.addWidget(self.lbl_page); tb.addStretch()
+
+        # Device name broadcast status instead of IP
+        device_name_display = load_device_name() or socket.gethostname()
+        self.lbl_top_ip = QLabel(f"● {device_name_display[:20]}")
+        self.lbl_top_ip.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-family: monospace; font-size: 9pt;")
+        tb.addWidget(self.lbl_top_ip)
+        right_layout.addWidget(topbar)
+
+        # Pages
+        self.stack = QStackedWidget()
+        self.sender_screen   = SenderScreen()
+        self.receiver_screen = ReceiverScreen()
+        self.history_screen  = HistoryScreen()
+        self.settings_screen = SettingsScreen()
+        self.stack.addWidget(self.sender_screen)
+        self.stack.addWidget(self.receiver_screen)
+        self.stack.addWidget(self.history_screen)
+        self.stack.addWidget(self.settings_screen)
+        
+        self.history_screen.resume_requested.connect(self._on_history_resume)
+        self.receiver_screen.ip_updated_signal.connect(self._on_ip_updated)
+        
+        right_layout.addWidget(self.stack, 1)
+        root_layout.addWidget(right, 1)
+
+    def _toggle_drawer(self):
+        self.drawer_open = not self.drawer_open
+        self.drawer.setVisible(self.drawer_open)
+
+    def _on_nav(self, idx):
+        self.stack.setCurrentIndex(idx)
+        self.lbl_page.setText(self.PAGE_TITLES[idx])
+        if idx == 1:
+            self.receiver_screen.refresh_ip()
+            self.receiver_screen.refresh_received_files()
+        elif idx == 2:
+            self.history_screen.refresh()
+
+    def _on_ip_updated(self, ip: str):
+        # Don't show IP in top bar; show device name instead
+        name = load_device_name() or socket.gethostname()
+        self.lbl_top_ip.setText(f"● {name[:20]}")
+
+    def _on_history_resume(self, entry):
+        self.drawer.set_active(0)
+        self._on_nav(0)
+        self.sender_screen.resume_from_history(entry)
+
+    def closeEvent(self, event):
+        # Stop receiver server on app close
+        if hasattr(self, 'receiver_screen') and self.receiver_screen.server:
+            self.receiver_screen.server.stop()
+        event.accept()
+
+    def _apply_styles(self):
+        self.setStyleSheet(f"""
+            QMainWindow, #centralRoot {{
+                background-color: {SOLORA_BG};
+                color: {SOLORA_TEXT_PRIMARY};
+                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            }}
+            QWidget {{
+                color: {SOLORA_TEXT_PRIMARY};
+                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            }}
+            QLabel {{
+                background-color: transparent;
+            }}
+            QFrame#card {{
+                background-color: {SOLORA_SURFACE_CARD};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 14px;
+            }}
+            QLineEdit {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                color: {SOLORA_NEON_LIME};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-family: monospace; font-size: 10pt;
+            }}
+            QLineEdit:focus {{ border: 1px solid {SOLORA_CYAN}; }}
+            QPushButton {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                color: {SOLORA_TEXT_PRIMARY};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 10px;
+                padding: 8px 16px;
+                font-weight: bold; font-size: 9pt;
+            }}
+            QPushButton:hover {{ border: 1px solid {SOLORA_CYAN}; color: {SOLORA_CYAN}; }}
+            QPushButton:checked {{ background-color: {SOLORA_CYAN}; color: {SOLORA_BG}; border: 1px solid {SOLORA_CYAN}; }}
+            QProgressBar {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 7px;
+            }}
+            QProgressBar::chunk {{
+                background-color: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {SOLORA_CYAN},stop:1 {SOLORA_ENERGY_GREEN});
+                border-radius: 6px;
+            }}
+            QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; }}
+            QSpinBox {{
+                background-color: {SOLORA_SURFACE_ELEVATED};
+                color: {SOLORA_TEXT_PRIMARY};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 8px; padding: 4px 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 18px; height: 18px;
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 4px;
+                background: {SOLORA_SURFACE_ELEVATED};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {SOLORA_ENERGY_GREEN};
+                border: 1px solid {SOLORA_ENERGY_GREEN};
+            }}
+        """)
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = NexusFlowLinuxApp()
+    window.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
