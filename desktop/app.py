@@ -445,8 +445,26 @@ class PairTarget:
         return bool(self.host)
 
 
+def build_pairing_name(name: str) -> str:
+    """``nexus://receive/<name>`` — a pairing code that carries no address.
+
+    The receiver QR used to encode the host and port alongside the name, so a
+    photo of that QR handed over the machine's LAN address. Senders discover the
+    address over mDNS/NSD by name, so the QR now carries only the name and the
+    sender resolves it. Kept parseable by parse_pairing_url(), which falls back
+    to discovery when no host is present.
+    """
+    from urllib.parse import quote
+    return f"{NEXUS_SCHEME}://receive/{quote(name or '', safe='')}"
+
+
 def build_pairing_url(host: str, port: int, name: str = "") -> str:
-    """``nexus://receive/<name>?host=<ip>&port=<n>`` — what the QR encodes."""
+    """``nexus://receive/<name>?host=<ip>&port=<n>``.
+
+    Still used when a host is explicitly known (e.g. importing another device's
+    code); the receiver's own QR uses build_pairing_name() instead so it does not
+    disclose an address.
+    """
     from urllib.parse import quote
     url = f"{NEXUS_SCHEME}://receive/{quote(name or host, safe='')}"
     params = []
@@ -686,21 +704,8 @@ class NavDrawer(QWidget):
         hl.setContentsMargins(16, 12, 16, 12)
         hl.setSpacing(12)
 
-        logo_lbl = QLabel()
-        logo_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "android", "app", "src", "main", "res", "drawable", "ic_nexus_flow.png"
-        )
-        if os.path.exists(logo_path):
-            pix = QPixmap(logo_path).scaled(38, 38, Qt.AspectRatioMode.KeepAspectRatio,
-                                             Qt.TransformationMode.SmoothTransformation)
-            logo_lbl.setPixmap(pix)
-        else:
-            logo_lbl.setText("◈")
-            logo_lbl.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: 20pt;")
-        logo_lbl.setFixedSize(42, 42)
-        hl.addWidget(logo_lbl)
-
+        # No logo bitmap: the wordmark alone identifies the app, matching the
+        # Android build where the same image was removed from every screen.
         tc = QVBoxLayout(); tc.setSpacing(2)
         lbl_n = QLabel("<span style='color:#00D4FF; font-weight:900;'>NEXUS </span>"
                        "<span style='color:#00E599; font-weight:900;'>FLOW</span>")
@@ -807,6 +812,71 @@ class WorkerBridge(QObject):
 
 
 # ─── Sender Screen ────────────────────────────────────────────────────────────
+class DropZoneFrame(QFrame):
+    """A frame that highlights itself while a file is dragged over it.
+
+    Qt only routes drag events to the widget that accepts them, so a plain
+    QFrame inside the panel cannot show hover feedback. This subclass toggles a
+    dynamic property (``dragActive``) so the stylesheet can react, and emits
+    ``fileDropped`` with the first local file path in the drop.
+    """
+
+    fileDropped = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_active = False
+
+    def _set_drag_active(self, active: bool):
+        if active == self._drag_active:
+            return
+        self._drag_active = active
+        # Dynamic property + repolish makes Qt re-evaluate the stylesheet.
+        self.setProperty("dragActive", "true" if active else "false")
+        style = self.style()
+        if style is not None:
+            style.unpolish(self)
+            style.polish(self)
+        self.update()
+
+    @staticmethod
+    def _first_local_file(mime) -> str:
+        if mime is None or not mime.hasUrls():
+            return ""
+        for url in mime.urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if os.path.isfile(path):
+                    return path
+        return ""
+
+    def dragEnterEvent(self, event):
+        if self._first_local_file(event.mimeData()):
+            self._set_drag_active(True)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._first_local_file(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_drag_active(False)
+        event.accept()
+
+    def dropEvent(self, event):
+        self._set_drag_active(False)
+        path = self._first_local_file(event.mimeData())
+        if path:
+            self.fileDropped.emit(path)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class SenderScreen(QWidget):
     def __init__(self, parent=None, bridge: WorkerBridge = None):
         super().__init__(parent)
@@ -916,12 +986,21 @@ class SenderScreen(QWidget):
         cl = QVBoxLayout(cc); cl.setContentsMargins(18,16,18,16); cl.setSpacing(12)
 
         # ── Nearby Devices Discovery Panel ──
-        nearby_frame = QFrame()
+        # Doubles as the app's drag-and-drop target: a file dropped anywhere in
+        # this panel is selected exactly as if it had been picked with
+        # SELECT FILE FROM DISK (it routes through SenderScreen.set_file).
+        nearby_frame = DropZoneFrame()
+        nearby_frame.setObjectName("nearbyFrame")
+        nearby_frame.setAcceptDrops(True)
         nearby_frame.setStyleSheet(f"""
-            QFrame {{
+            QFrame#nearbyFrame {{
                 background-color: {SOLORA_SURFACE_ELEVATED};
                 border: 1px solid {alpha(SOLORA_CYAN, 0.3)};
                 border-radius: 10px;
+            }}
+            QFrame#nearbyFrame[dragActive="true"] {{
+                background-color: {alpha(SOLORA_CYAN, 0.10)};
+                border: 2px solid {SOLORA_CYAN};
             }}
             QLabel {{ background: transparent; }}
         """)
@@ -969,6 +1048,11 @@ class SenderScreen(QWidget):
         self.nearby_devices_layout = QHBoxLayout(self.nearby_devices_container)
         self.nearby_devices_layout.setContentsMargins(0, 0, 0, 0)
         self.nearby_devices_layout.setSpacing(8)
+
+        # Faded drop hint. It lives in the empty-state block of
+        # refresh_nearby_devices_ui(), so it appears only when no peers are
+        # discovered and disappears when cards appear.
+        nearby_frame.fileDropped.connect(self._on_panel_file_dropped)
 
         nearby_scroll = QScrollArea()
         # Item 11: minimum height + expanding policy instead of a rigid 64px, so
@@ -1243,6 +1327,35 @@ class SenderScreen(QWidget):
         self.txt_port.setText(str(port))
         self.test_connection()
 
+    def _add_drop_hint(self, layout=None):
+        """Add the faded 'DRAG AND DROP FILES OVER HERE' prompt.
+
+        Only shown while the panel is empty. When peers are discovered the cards
+        fill the row, so the hint would squeeze them into half the width and
+        read as clutter -- refresh_nearby_devices_ui() omits it in that case.
+        A dimmed token colour keeps it readable without competing with the
+        NEARBY DEVICES heading.
+        """
+        hint = QLabel("DRAG AND DROP FILES OVER HERE")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        hint.setStyleSheet(
+            f"color: {alpha(SOLORA_TEXT_MUTED, 0.75)};"
+            f" font-size: {FS_SMALL}; font-weight: bold; letter-spacing: 2px;"
+            " background: transparent;")
+        hint.setAccessibleName(
+            "Drag and drop files over here to select them for sending")
+        target = layout if layout is not None else self.nearby_devices_layout
+        target.addWidget(hint)
+
+    def _on_panel_file_dropped(self, path: str):
+        """A file was dropped on the nearby-devices panel.
+
+        Routed through set_file() so a dropped file lands in exactly the same
+        state as one chosen with SELECT FILE FROM DISK.
+        """
+        self.set_file(path)
+
     def refresh_nearby_devices_ui(self, _peers=None):
         """Rebuild the nearby-devices panel from current discovery results.
 
@@ -1260,16 +1373,26 @@ class SenderScreen(QWidget):
             return
         self._peer_signature = signature
 
-        # Clear old buttons
+        # Clear old buttons.
+        # setParent(None) before deleteLater() is deliberate: deleteLater() is
+        # deferred, so a widget stays a child of the frame until the event loop
+        # drains the delete event. Without detaching it first, the stale widgets
+        # (and their children) remain findable and are still painted for a
+        # frame, which duplicated the empty-state labels on every rebuild.
         while self.nearby_devices_layout.count() > 0:
             item = self.nearby_devices_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
 
         current_ip = self.txt_peer_name.text().strip()
 
         if not peers:
-            # Empty state with guidance — or a distinct unavailable state.
+            # Empty state: guidance plus the faded drop prompt, stacked
+            # vertically so the two never compete for horizontal space.
             empty_container = QWidget()
             empty_container.setStyleSheet("background: transparent;")
             empty_layout = QVBoxLayout(empty_container)
@@ -1291,6 +1414,7 @@ class SenderScreen(QWidget):
                 lbl_hint.setToolTip(reason)
                 empty_layout.addWidget(lbl_hint)
 
+                self._add_drop_hint(empty_layout)
                 self.nearby_devices_layout.addWidget(empty_container)
                 self.lbl_scanning.setText("● Discovery off")
                 self.lbl_scanning.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-size: {FS_META_SM}; font-weight: bold;")
@@ -1307,6 +1431,7 @@ class SenderScreen(QWidget):
             lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_layout.addWidget(lbl_hint)
 
+            self._add_drop_hint(empty_layout)
             self.nearby_devices_layout.addWidget(empty_container)
 
             self.lbl_scanning.setText("● Scanning...")
@@ -1792,39 +1917,22 @@ class ReceiverScreen(QWidget):
         self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_SMALL};")
         cl.addWidget(self.lbl_broadcast_status)
 
-        # Subtle IP hint (collapsible)
-        # Item 20: a real focusable QPushButton instead of a monkeypatched QLabel.
-        self.ip_hint_label = QPushButton("▼  Show local IP (for manual entry)")
-        self.ip_hint_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.ip_hint_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.ip_hint_label.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; text-align: left;"
-            f" color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-weight: bold;"
-            f" letter-spacing: 1px; padding: 0; }}"
-            f"QPushButton:hover {{ color: {SOLORA_CYAN}; background: transparent; }}"
-            f"QPushButton:focus {{ color: {SOLORA_CYAN}; }}")
-        self.ip_hint_label.setAccessibleName("Toggle local IP display")
-        self.ip_hint_label.setToolTip("Show or hide this device's local addresses")
-        self.ip_hint_label.clicked.connect(self._toggle_ip_hint)
-        cl.addWidget(self.ip_hint_label)
-
-        self.ip_hint_widget = QWidget()
-        self.ip_hint_widget.setVisible(False)
-        ip_hint_layout = QVBoxLayout(self.ip_hint_widget)
-        ip_hint_layout.setContentsMargins(0, 8, 0, 0)
-        ip_hint_layout.setSpacing(4)
-
+        # No local IP is displayed anywhere on this screen. It used to be behind
+        # a collapsible "Show local IP" hint and also encoded into a scannable QR
+        # bitmap, which put the machine's address on screen for anyone nearby
+        # and in any screenshot. Senders resolve this device by name over
+        # mDNS/NSD, so the address is never needed. Matches the Android receiver.
         ips = get_local_ips()
         self.current_ip = ips[0] if ips else "127.0.0.1"
-        self.lbl_endpoint = QLabel(f"Local Endpoint:  <span style='color:{SOLORA_NEON_LIME}; font-size:11pt; font-family:monospace;'><b>http://{self.current_ip}:{SETTINGS.port}</b></span>")
-        self.lbl_endpoint.setWordWrap(True)
-        ip_hint_layout.addWidget(self.lbl_endpoint)
 
-        self.lbl_more_ips = QLabel("  Also: " + "  |  ".join(f"http://{x}:{SETTINGS.port}" for x in ips[1:])) if len(ips) > 1 else QLabel("")
-        self.lbl_more_ips.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM}; font-family: {FONT_MONO};")
-        ip_hint_layout.addWidget(self.lbl_more_ips)
-
-        cl.addWidget(self.ip_hint_widget)
+        # Device name, the only identity shown for pairing.
+        self.lbl_device_identity = QLabel(
+            f"<b style='color:{SOLORA_ENERGY_GREEN};'>Broadcasting as:</b> "
+            f"<b style='color:{SOLORA_ENERGY_GREEN};'>{self._device_name}</b>"
+        )
+        self.lbl_device_identity.setWordWrap(True)
+        self.lbl_device_identity.setAccessibleName("This device name as seen by nearby senders")
+        cl.addWidget(self.lbl_device_identity)
 
         qr_row = QHBoxLayout()
         self.lbl_qr = QLabel()
@@ -1834,7 +1942,9 @@ class ReceiverScreen(QWidget):
         self.lbl_qr.setAccessibleName("Pairing QR code")
         self.lbl_qr.setAccessibleDescription(
             "Scan or copy this code on the sender device to prefill host and port.")
-        self.update_qr(build_pairing_url(self.current_ip, SETTINGS.port, self._device_name))
+        # The QR encodes the device NAME, not an address, so scanning it does
+        # not disclose this machine's IP to a camera.
+        self.update_qr(build_pairing_name(self._device_name))
         qr_row.addWidget(self.lbl_qr)
 
         qr_row.addSpacing(16)
@@ -1963,20 +2073,21 @@ class ReceiverScreen(QWidget):
         self.refresh_received_files()
 
     def refresh_ip(self):
+        """Refresh the local address used for binding and pairing.
+
+        The address is no longer rendered anywhere: the old endpoint labels
+        were set here and then immediately blanked a few lines later, which was
+        the dead set-then-clear flagged in the audit. Only the pairing QR (which
+        now encodes the device name) and the instructions are updated.
+        """
         ips = get_local_ips()
         self.current_ip = ips[0] if ips else "127.0.0.1"
-        self.lbl_endpoint.setText(f"Local Endpoint:  <span style='color:{SOLORA_NEON_LIME}; font-size:13pt; font-family:monospace;'><b>http://{self.current_ip}:8000</b></span>")
-        if len(ips) > 1:
-            self.lbl_more_ips.setText("  Also: " + "  |  ".join(f"http://{x}:8000" for x in ips[1:]))
-        else:
-            self.lbl_more_ips.setText("")
-        # Update pairing instructions without IP reference
+        self.lbl_device_identity.setText(
+            f"<b style='color:{SOLORA_ENERGY_GREEN};'>Broadcasting as:</b> "
+            f"<b style='color:{SOLORA_ENERGY_GREEN};'>{self._device_name}</b>"
+        )
         self.lbl_step2.setText(f"2. Tap your device name <b>{self._device_name}</b> on the sender device (auto-discovered).")
-        # Hide endpoint/IP text when not needed
-        self.lbl_endpoint.setText("")
-        self.lbl_more_ips.setText("")
-        # Keep QR code but don't reference IP in text
-        self.update_qr(f"nexus://receive/{self._device_name}")
+        self.update_qr(build_pairing_name(self._device_name))
         self.ip_updated_signal.emit(self.current_ip)
 
     def refresh_received_files(self):
@@ -2093,13 +2204,6 @@ class ReceiverScreen(QWidget):
             self.lbl_payload_info.setText("Server stopped. Not discoverable.")
             # Reset QR code pairing instruction
             self.lbl_step2.setText(f"2. On sender device, tap your device name: <b>{self._device_name}</b> (no IP needed).")
-
-    def _toggle_ip_hint(self):
-        """Toggle visibility of IP hint section."""
-        is_visible = self.ip_hint_widget.isVisible()
-        self.ip_hint_widget.setVisible(not is_visible)
-        label_text = "▲  Hide local IP" if not is_visible else "▼  Show local IP (for manual entry)"
-        self.ip_hint_label.setText(label_text)
 
     def on_server_state_update(self, rec: dict):
         fname = rec.get("filename", "")
@@ -2296,12 +2400,13 @@ class NexusFlowLinuxApp(QMainWindow):
         self.setAcceptDrops(True)
         self._restore_window_state()
 
-        logo_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "android", "app", "src", "main", "res", "drawable", "ic_nexus_flow.png"
-        )
-        if os.path.exists(logo_path):
-            self.setWindowIcon(QIcon(logo_path))
+        # Window / taskbar icon. This is OS chrome rather than in-app UI, so the
+        # logo bitmap stays here even though the in-app wordmarks are now
+        # text-only. Routed through find_logo_path() so it degrades cleanly when
+        # the asset is not bundled.
+        _logo = find_logo_path()
+        if _logo:
+            self.setWindowIcon(QIcon(_logo))
 
         self.drawer_open = True
         self._init_ui()
