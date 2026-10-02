@@ -88,6 +88,7 @@
     <string name="receiver_visible_as_name">Visible to nearby senders</string>
 
     <!-- Receiver -->
+    <string name="receiver_hub_title">RECEIVER HUB</string>
     <string name="receiver_enable">Enable Receiving</string>
     <string name="cd_open_downloads">Open downloads folder</string>
     <string name="receiver_no_files">No files received yet</string>

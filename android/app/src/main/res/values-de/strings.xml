@@ -59,6 +59,7 @@
     <string name="receiver_nearby_body">Sender im selben Netzwerk finden dieses Gerät automatisch nach Namen.</string>
     <string name="receiver_visible_as_name">Für Sender in der Nähe sichtbar</string>
 
+    <string name="receiver_hub_title">EMPFÄNGER-HUB</string>
     <string name="receiver_enable">Empfang aktivieren</string>
     <string name="receiver_no_files">Noch keine Dateien empfangen</string>
 

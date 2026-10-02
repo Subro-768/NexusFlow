@@ -9,7 +9,6 @@ import android.os.Environment
 import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -29,7 +28,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -85,26 +83,27 @@ fun ReceiverScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Image(
-                            painter = painterResource(id = R.drawable.ic_nexus_flow),
-                            contentDescription = "Nexus Flow Logo",
-                            modifier = Modifier.size(34.dp)
-                        )
+                        // Logo bitmap removed for consistency with the sender
+                        // app bar and the drawer: wordmark only.
                         Column {
                             Text(
                                 text = buildAnnotatedString {
-                                    withStyle(SpanStyle(color = SoloraCyan, fontWeight = FontWeight.Black)) {
-                                        append("NEXUS ")
+                                    withStyle(
+                                        SpanStyle(color = SoloraCyan, fontWeight = FontWeight.Black)
+                                    ) {
+                                        append(stringResource(R.string.brand_name_full))
                                     }
-                                    withStyle(SpanStyle(color = SoloraEnergyGreen, fontWeight = FontWeight.Black)) {
-                                        append("FLOW")
+                                    withStyle(
+                                        SpanStyle(color = SoloraEnergyGreen, fontWeight = FontWeight.Black)
+                                    ) {
+                                        append(stringResource(R.string.brand_name_accent))
                                     }
                                 },
                                 fontSize = 16.sp,
                                 letterSpacing = 1.5.sp
                             )
                             Text(
-                                "RECEIVER HUB",
+                                stringResource(R.string.receiver_hub_title),
                                 fontSize = 9.sp,
                                 color = SoloraSolarAmber,
                                 fontWeight = FontWeight.Bold,
