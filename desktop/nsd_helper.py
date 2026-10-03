@@ -40,10 +40,12 @@ def _get_local_ip() -> str:
 
 class PeerInfo:
     """Represents a discovered NexusFlow device on the LAN."""
-    def __init__(self, name: str, host: str, port: int):
+    def __init__(self, name: str, host: str, port: int, token: str = ""):
         self.name = name
         self.host = host
         self.port = port
+        #: Pairing token advertised by the peer, when it published one.
+        self.token = token
 
     def __repr__(self):
         return f"PeerInfo(name={self.name!r}, host={self.host}, port={self.port})"

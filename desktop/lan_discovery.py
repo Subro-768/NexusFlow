@@ -55,11 +55,13 @@ _BROADCAST = "255.255.255.255"
 class LanPeer:
     """A peer seen over UDP broadcast discovery."""
 
-    def __init__(self, name: str, host: str, port: int, key: str):
+    def __init__(self, name: str, host: str, port: int, key: str, token: str = ""):
         self.name = name
         self.host = host
         self.port = port
         self.key = key
+        #: Pairing token the peer advertised in its discovery reply, if any.
+        self.token = token
         self.last_seen = time.monotonic()
 
     def __repr__(self):
@@ -153,10 +155,13 @@ class _Responder(threading.Thread):
     daemon = True
 
     def __init__(self, name: str, port: int, own_ips: Set[str],
-                 on_peer: Optional[Callable[[LanPeer], None]] = None):
+                 on_peer: Optional[Callable[[LanPeer], None]] = None,
+        auth_token: str = ""):
         super().__init__(name="nexusflow-responder")
         self.device_name = name or "NexusFlow Device"
         self.service_port = port
+        #: Pairing token advertised in the discovery reply, when there is one.
+        self.auth_token: str = auth_token or ""
         self.own_ips = set(own_ips)
         self.on_peer = on_peer
         self._running = threading.Event()
@@ -164,13 +169,28 @@ class _Responder(threading.Thread):
 
     # -- helpers ---------------------------------------------------------
     def _identity(self) -> dict:
-        return {
+        hello = {
             "t": "h",
             "n": self.device_name,
             "p": self.service_port,
             "v": 1,
             "id": local_ip(),
         }
+        # The pairing token rides in the discovery reply, which is what lets a
+        # tapped peer authenticate without the QR.
+        #
+        # This is a deliberate trade, and it weakens the threat model the token
+        # exists for: discovery is unauthenticated UDP broadcast, so anything on
+        # the network can ask "who is out there?" and read this back. The token
+        # therefore proves only that a sender was told it by a peer -- it stops a
+        # stranger *scanning the network* from writing files, and does not stop one
+        # who is already listening to discovery.
+        #
+        # Kept because tap-to-connect is the common path and requiring a camera for
+        # every transfer would be worse. The QR remains the private route.
+        if self.auth_token:
+            hello["tok"] = self.auth_token
+        return hello
 
     def _send(self, payload: dict, dest: tuple):
         if not self._sock:
@@ -254,6 +274,7 @@ class _Responder(threading.Thread):
                     host=host,
                     port=int(msg.get("p") or 8000),
                     key=f"{msg.get('n') or host}|{host}",
+                    token=str(msg.get("tok") or ""),
                 )
                 if self.on_peer:
                     try:
@@ -278,8 +299,14 @@ class LanDiscovery:
 
     # -- responder (receiver side) ---------------------------------------
     def advertise(self, device_name: str, service_port: int,
-                  own_ips: Optional[List[str]] = None) -> bool:
-        """Start announcing this device. Call when receiving is enabled."""
+                  own_ips: Optional[List[str]] = None,
+                  auth_token: str = "") -> bool:
+        """Start announcing this device. Call when receiving is enabled.
+
+        ``auth_token`` is this receiver's pairing token, published in the
+        discovery reply so a tapped peer can authenticate without the camera.
+        See _Responder._identity for what that does and does not protect against.
+        """
         self._own_ips = set(own_ips or [local_ip()])
         self.stop_advertise()
         self._responder = _Responder(
@@ -287,6 +314,7 @@ class LanDiscovery:
             port=service_port,
             own_ips=self._own_ips,
             on_peer=self._note_peer,
+            auth_token=auth_token,
         )
         self._responder.start()
         # Give the socket a moment so an immediate scan sees us.
@@ -372,6 +400,7 @@ class LanDiscovery:
                     host=host,
                     port=int(msg.get("p") or 8000),
                     key=f"{msg.get('n') or host}|{host}",
+                    token=str(msg.get("tok") or ""),
                 )
                 with self._lock:
                     self._peers[peer.key] = peer

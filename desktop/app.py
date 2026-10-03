@@ -883,23 +883,23 @@ class WorkerBridge(QObject):
         self.peers_changed.emit(list(peers or []))
 
 
-def _make_peer(name: str, host: str, port: int):
+def _make_peer(name: str, host: str, port: int, token: str = ""):
     """Build a peer record the nearby-devices panel can render.
 
     Uses nsd_helper.PeerInfo when importable and falls back to a tiny local
     object, so a missing dependency degrades discovery instead of the app.
     """
     if PeerInfo is not None:
-        return PeerInfo(name, host, port)
+        return PeerInfo(name, host, port, token)
 
     class _Peer:
-        def __init__(self, n, h, p):
-            self.name, self.host, self.port = n, h, p
+        def __init__(self, n, h, p, t=""):
+            self.name, self.host, self.port, self.token = n, h, p, t
 
         def __repr__(self):
             return f"PeerInfo(name={self.name!r}, host={self.host}, port={self.port})"
 
-    return _Peer(name, host, port)
+    return _Peer(name, host, port, token)
 
 
 # ─── Sender Screen ────────────────────────────────────────────────────────────
@@ -1634,10 +1634,18 @@ class SenderScreen(QWidget):
         self.txt_peer_name.setText(ip)
         self.test_connection()
 
-    def select_peer(self, host: str, port: int, name: str):
-        """Called when user clicks a discovered nearby device button."""
+    def select_peer(self, host: str, port: int, name: str, token: str = ""):
+        """Called when user clicks a discovered nearby device button.
+
+        A peer that advertised a pairing token in its discovery reply is
+        remembered against its host here, so the transfer authenticates without
+        the QR. Peers that publish none simply have no entry, and a later scan
+        or a scanned code supplies one.
+        """
         self.txt_peer_name.setText(host)
         self.txt_port.setText(str(port))
+        if token:
+            peer_tokens[host.strip()] = token
         self.test_connection()
 
     def _add_drop_hint(self, layout=None):
@@ -1826,8 +1834,13 @@ class SenderScreen(QWidget):
                     check_lbl.setFixedWidth(24)
                     card_layout.addWidget(check_lbl)
 
+                # The token is bound as a default argument for the same reason
+                # host/port/name are. Referencing `peer` inside the body would
+                # evaluate it at click time, by which point the loop has moved
+                # on: every card would then send the last peer's token.
                 peer_card.clicked.connect(
-                    lambda _=False, h=peer.host, p=peer.port, n=peer.name: self.select_peer(h, p, n))
+                    lambda _=False, h=peer.host, p=peer.port, n=peer.name,
+                    tk=getattr(peer, "token", ""): self.select_peer(h, p, n, tk))
 
                 self.nearby_devices_layout.addWidget(peer_card)
 
