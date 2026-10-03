@@ -8,10 +8,28 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-class TransferApiClient(private val serverUrl: String) {
+class TransferApiClient(
+    private val serverUrl: String,
+    connectTimeoutSeconds: Long = DEFAULT_CONNECT_TIMEOUT_SECONDS
+) {
+
+    companion object {
+        /**
+         * Generous for a real LAN transfer: a busy hotspot can take a second or
+         * two to answer, and failing a live peer would be worse than waiting.
+         */
+        const val DEFAULT_CONNECT_TIMEOUT_SECONDS = 5L
+
+        /**
+         * Used for the "is anybody there at all?" pre-flight. Long enough to
+         * avoid a false negative, short enough that an absent device is named
+         * in about a second instead of after three full timeouts.
+         */
+        const val PREFLIGHT_CONNECT_TIMEOUT_SECONDS = 2L
+    }
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)

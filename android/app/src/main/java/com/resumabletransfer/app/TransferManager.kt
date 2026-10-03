@@ -829,11 +829,46 @@ class TransferManager private constructor(private val context: Context) {
  * overwrite INTERRUPTED or COMPLETED with PAUSED, which a notification action
  * could then re-label a finished transfer as resumable.
  */
-fun pauseTransfer() {
+    fun pauseTransfer() {
     if (_progressState.value.status !in PAUSABLE_STATUSES) return
         isPaused = true
         updateProgress { it.copy(status = TransferStatus.PAUSED, logMessage = "Transfer paused.") }
     }
+
+    /**
+     * The UI is about to probe a target; show that before any socket opens.
+     *
+     * Otherwise the card sits on its previous state for the length of the probe
+     * and the tap looks like it did nothing.
+     */
+    fun reportConnecting() {
+        updateProgress {
+            it.copy(
+                status = TransferStatus.CONNECTING,
+                logMessage = "Checking for a receiving device..."
+            )
+        }
+    }
+
+    /**
+     * Nothing answered at [host]:[port].
+     *
+     * Deliberately not INTERRUPTED. That status promises resumable progress,
+     * and there is none here -- nothing ever started, so RESUME and an
+     * interruption message both misdescribe it. The session id is kept so a
+     * later RESUME still refers to the right session.
+     */
+    fun reportNoDevice(host: String, port: String) {
+        updateProgress {
+            it.copy(
+                status = TransferStatus.NO_DEVICE,
+                speedBytesPerSec = 0L,
+                etaSeconds = 0L,
+                logMessage = "No device answered at $host:$port. Turn on "
+            )
+        }
+    }
+
 
     /**
      * Resume driven from outside the UI (the notification's Resume action).

@@ -602,7 +602,10 @@ private fun ControlButtons(
                     )
                 }
             }
-            TransferStatus.PAUSED, TransferStatus.INTERRUPTED -> {
+            TransferStatus.PAUSED, TransferStatus.INTERRUPTED, TransferStatus.NO_DEVICE -> {
+                // NO DEVICE sits here on purpose: the bytes on the receiver are
+                // untouched, so this is a retry from the same offset rather than
+                // a fresh send. Without a button the card had no way out.
                 Button(
                     onClick = onResumeTransfer,
                     modifier = Modifier
@@ -1137,7 +1140,11 @@ private fun PeerDiscoveryPanel(
 @Composable
 private fun ErrorBanner(errorMessage: String, status: TransferStatus) {
     if (errorMessage.isBlank()) return
-    if (status != TransferStatus.FAILED && status != TransferStatus.INTERRUPTED) return
+    // NO_DEVICE included: it is the one failure the app can name exactly, so it
+    // is the one most worth saying out loud rather than only in a toast.
+    if (status != TransferStatus.FAILED &&
+        status != TransferStatus.INTERRUPTED &&
+        status != TransferStatus.NO_DEVICE) return
 
     val tint = status.accentColor()
     Surface(
@@ -1292,6 +1299,9 @@ internal fun TransferStatus.accentColor(): Color = when (this) {
     TransferStatus.INTERRUPTED, TransferStatus.FAILED -> SoloraAlertRed
     TransferStatus.PAUSED -> SoloraSolarAmber
     TransferStatus.CONNECTING -> SoloraCyan
+    // No device answered: the same alert colour as INTERRUPTED, because nothing
+    // is moving, but a separate value so the message can say why.
+    TransferStatus.NO_DEVICE -> SoloraAlertRed
     // Queued: accepted and persisted, not started. Cyan, because it is waiting on
     // the same thing a connecting transfer is.
     TransferStatus.QUEUED -> SoloraCyan
@@ -1303,6 +1313,7 @@ internal fun TransferStatus.accentColor(): Color = when (this) {
 internal fun TransferStatus.labelRes(): Int = when (this) {
     TransferStatus.IDLE -> R.string.status_idle
     TransferStatus.QUEUED -> R.string.status_queued
+    TransferStatus.NO_DEVICE -> R.string.status_no_device
     TransferStatus.CONNECTING -> R.string.status_connecting
     TransferStatus.READY -> R.string.status_ready
     TransferStatus.TRANSFERRING -> R.string.status_transferring

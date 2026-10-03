@@ -860,10 +860,48 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startTransfer() {
+        val url = "http://${serverIp.trim()}:${serverPort.trim()}"
+        if (!targetIsWorthTrying(url)) return
+
+        beginTransfer(url)
+    }
+
+    /**
+     * Whether a press of START is worth attempting at [url], or whether nothing
+     * is there and the user should be told now.
+     *
+     * A peer discovery has already seen needs no proof -- probing it again would
+     * only add latency to the common case. Loopback is always attempted, since
+     * adb reverse puts the receiver there without anything to discover.
+     */
+    private fun targetIsWorthTrying(url: String): Boolean {
+        val host = serverIp.trim()
+        val port = serverPort.trim()
+        val known = discoveredPeers.any { it.host == host && it.port.toString() == port }
+        if (known || host == "127.0.0.1") return true
+
+        transferManager.reportConnecting()
+        lifecycleScope.launch {
+            val reachable = withContext(Dispatchers.IO) {
+                TransferApiClient(
+                    url,
+                    connectTimeoutSeconds = TransferApiClient.PREFLIGHT_CONNECT_TIMEOUT_SECONDS
+                ).checkHealth().isSuccess
+            }
+            if (reachable) {
+                beginTransfer(url)
+            } else {
+                transferManager.reportNoDevice(host, port)
+                notifyUser(getString(R.string.msg_no_device, host, port))
+            }
+        }
+        return false
+    }
+
+    private fun beginTransfer(url: String) {
         val uri = selectedFileUri ?: transferManager.getSavedFileUri() ?: return
         val name = selectedFileName ?: transferManager.getSavedFileName() ?: "file"
         val size = selectedFileSize ?: transferManager.getSavedFileSize() ?: return
-        val url = "http://${serverIp.trim()}:${serverPort.trim()}"
 
         val serviceIntent = Intent(this, TransferForegroundService::class.java).apply {
             action = TransferForegroundService.ACTION_START
@@ -884,6 +922,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun resumeTransfer() {
+        val url = "http://${serverIp.trim()}:${serverPort.trim()}"
+        // Same pre-flight as a fresh send: resuming into an address with nothing
+        // on it is how you get another stretch of nothing happening.
+        if (!targetIsWorthTrying(url)) return
+        resumeTransferAgainst(url)
+    }
+
+    private fun resumeTransferAgainst(url: String) {
         val uri = selectedFileUri ?: transferManager.getSavedFileUri()
         if (uri == null) {
             notifyUser(getString(R.string.msg_select_file_to_resume))

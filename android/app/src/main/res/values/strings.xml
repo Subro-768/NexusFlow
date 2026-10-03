@@ -192,4 +192,6 @@
     <string name="pairing_dialog_connect">CONNECT</string>
     <string name="pairing_dialog_bad_code">That does not look like a pairing code.</string>
     <string name="cancel">Cancel</string>
+    <string name="status_no_device">NO DEVICE</string>
+    <string name="msg_no_device">No device answered at %1$s:%2$s. Turn on Enable Receiving on the other device, then press Resume.</string>
 </resources>

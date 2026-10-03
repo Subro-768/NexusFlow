@@ -14,6 +14,15 @@ enum class TransferStatus {
      */
     QUEUED,
     CONNECTING,
+    /**
+     * Nothing answered at the target address.
+     *
+     * Distinct from INTERRUPTED on purpose. INTERRUPTED means a transfer was
+     * under way and lost its connection, and it is resumable because there is
+     * something to resume. Here nothing ever started, so offering RESUME and
+     * reporting an interruption both misdescribe what happened.
+     */
+    NO_DEVICE,
     READY,
     TRANSFERRING,
     PAUSED,

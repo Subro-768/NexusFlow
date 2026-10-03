@@ -148,4 +148,6 @@
     <string name="pairing_dialog_connect">VERBINDEN</string>
     <string name="pairing_dialog_bad_code">Das sieht nicht nach einem Kopplungs-Code aus.</string>
     <string name="cancel">Abbrechen</string>
+    <string name="status_no_device">KEIN GERÄT</string>
+    <string name="msg_no_device">Kein Gerät unter %1$s:%2$s erreichbar. Aktiviere auf dem anderen Gerät „Empfangen“ und drücke dann Fortsetzen.</string>
 </resources>
