@@ -133,4 +133,10 @@
     <string name="msg_incoming_paused">Eingehende Übertragung pausiert</string>
     <string name="msg_incoming_resumed">Eingehende Übertragung fortgesetzt</string>
     <string name="msg_incoming_cancelled">Eingehende Übertragung abgebrochen — die Teildatei wurde gelöscht</string>
+    <string name="qr_scan_prompt">Kamera auf den Kopplungs-Code des empfangenden Geräts richten</string>
+    <string name="action_enter_manually">Stattdessen eintippen</string>
+    <string name="cd_scan_qr">Kopplungs-QR-Code scannen</string>
+    <string name="receiver_pairing_code">KOPPLUNGS-CODE</string>
+    <string name="receiver_pairing_hint">Tippe auf dem sendenden Gerät auf QR scannen und richte die Kamera auf diesen Code.</string>
+    <string name="msg_pairing_name_not_found">\'%1$s\' gescannt, aber noch nicht in der Geräteliste. Warte auf die Suche…</string>
 </resources>

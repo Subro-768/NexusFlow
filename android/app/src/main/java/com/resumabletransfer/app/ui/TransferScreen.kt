@@ -1,5 +1,6 @@
 package com.resumabletransfer.app.ui
 
+
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -48,6 +49,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Pause
@@ -117,6 +119,7 @@ fun TransferScreen(
     onSelectPeer: (PeerDevice) -> Unit = {},
     onRefreshPeers: () -> Unit = {},
     onScanQr: () -> Unit = {},
+    onManualPairingEntry: () -> Unit = {},
     isDiscovering: Boolean = false,
     sharedFiles: List<SharedFile> = emptyList(),
     sharedQueueIndex: Int = 0,
@@ -187,7 +190,8 @@ fun TransferScreen(
                 isDiscovering = isDiscovering,
                 onSelectPeer = onSelectPeer,
                 onRefreshPeers = onRefreshPeers,
-                onScanQr = onScanQr
+                onScanQr = onScanQr,
+                onManualPairingEntry = onManualPairingEntry
             )
 
             ErrorBanner(progress.errorMessage, progress.status)
@@ -975,7 +979,8 @@ private fun PeerDiscoveryPanel(
     isDiscovering: Boolean,
     onSelectPeer: (PeerDevice) -> Unit,
     onRefreshPeers: () -> Unit,
-    onScanQr: () -> Unit
+    onScanQr: () -> Unit,
+    onManualPairingEntry: () -> Unit
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -993,6 +998,11 @@ private fun PeerDiscoveryPanel(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(
+                    // weight(1f): without it this row takes its full intrinsic
+                    // width and shoves the action buttons off the right edge --
+                    // which is exactly what happened when the third button was
+                    // added. The title ellipsizes instead.
+                    modifier = Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
@@ -1005,7 +1015,10 @@ private fun PeerDiscoveryPanel(
                     Text(
                         stringResource(R.string.card_nearby_devices),
                         style = MaterialTheme.typography.labelSmall,
-                        color = SoloraCyan
+                        color = SoloraCyan,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1019,11 +1032,26 @@ private fun PeerDiscoveryPanel(
                             modifier = Modifier.size(16.dp)
                         )
                     }
+                    // Two plain buttons, not a tap/long-press gesture on one.
+                    //
+                    // The single button with a long-press fallback could not be
+                    // verified: an automated tap was being delivered as a long
+                    // press, so only the fallback ever fired and the scanner
+                    // looked broken. A scan button and a type button are also
+                    // just clearer to use.
                     IconButton(onClick = onScanQr, modifier = Modifier.size(MinTouchTarget)) {
                         Icon(
                             Icons.Default.QrCodeScanner,
                             contentDescription = stringResource(R.string.cd_scan_qr),
                             tint = SoloraNeonLime,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    IconButton(onClick = onManualPairingEntry, modifier = Modifier.size(MinTouchTarget)) {
+                        Icon(
+                            Icons.Default.Keyboard,
+                            contentDescription = stringResource(R.string.action_enter_manually),
+                            tint = SoloraTextSecondary,
                             modifier = Modifier.size(16.dp)
                         )
                     }

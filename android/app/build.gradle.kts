@@ -56,4 +56,9 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.okhttp.logging)
     implementation(libs.kotlinx.coroutines.android)
+
+    // QR: embedded gives the capture activity + CameraX preview;
+    // core is the encoder used to draw the pairing code on the receiver.
+    implementation(libs.zxing.android.embedded)
+    implementation(libs.zxing.core)
 }

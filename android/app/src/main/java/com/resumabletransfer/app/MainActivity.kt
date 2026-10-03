@@ -11,6 +11,8 @@ import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.foundation.layout.*
@@ -56,6 +58,19 @@ enum class ScreenNav(val title: String) {
 }
 
 private const val NEXUS_SCHEME = "nexus://"
+
+/** Name-only pairing form, matching the Linux Hub's QR. See applyPairingUri. */
+private const val RECEIVE_SCHEME = "nexus://receive/"
+
+/**
+ * The pairing payload this device shows as a QR.
+ *
+ * Name-only, for the same privacy reason as the Linux Hub: the code is
+ * photographed, screenshotted and sent over chat, and none of those should leak
+ * a LAN address. The sender resolves the name over mDNS.
+ */
+fun buildPairingPayload(deviceName: String): String =
+    RECEIVE_SCHEME + java.net.URLEncoder.encode(deviceName.ifBlank { "NexusFlow" }, "UTF-8")
 private const val DEFAULT_PORT = 8000
 
 private const val STATE_URI = "state_selected_uri"
@@ -130,6 +145,36 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Opens the camera to scan a peer's pairing code.
+     *
+     * The button used to open a text box and ask for `nexus://host:port`, which
+     * works but is not what "Scan QR code" implies -- and the Linux Receiver
+     * draws that exact string as a QR, so the user had to transcribe it by hand.
+     * This launches the real scanner; the typed dialog is still reachable as a
+     * fallback for a peer whose camera is broken or whose code is emailed.
+     */
+    private fun launchQrScanner() {
+        qrScanLauncher.launch(ScanOptions().apply {
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt(getString(R.string.qr_scan_prompt))
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+            // The payload is short; a short timeout stops the camera staring at
+            // the lens for anyone who opened it by mistake.
+            setTimeout(30_000L)
+        })
+    }
+
+    private val qrScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        if (result.contents.isNullOrBlank()) {
+            // Cancelled or timed out. Nothing to say: the button did nothing
+            // visible, so a snackbar here would be noise.
+            return@registerForActivityResult
+        }
+        applyPairingUri(result.contents)
+    }
+
+    /**
      * Handles a scanned or pasted `nexus://` pairing payload by pre-filling the
      * target host and port. The QR button used to render as an enabled icon with
      * an empty body while the desktop build encoded this scheme, so scanning a
@@ -140,6 +185,29 @@ class MainActivity : ComponentActivity() {
         val host: String?
         val port: Int?
         when {
+            // `nexus://receive/<name>` is what the Linux Hub draws and now what
+            // this app draws too. It carries no address on purpose: a photo of the
+            // QR should not hand over the machine's LAN IP. The name is resolved
+            // through the mDNS peer list instead.
+            uri.startsWith(RECEIVE_SCHEME) -> {
+                val wanted = runCatching {
+                    java.net.URLDecoder.decode(
+                        uri.removePrefix(RECEIVE_SCHEME).substringBefore('?').trim('/'),
+                        "UTF-8"
+                    )
+                }.getOrElse { uri.removePrefix(RECEIVE_SCHEME).substringBefore('?').trim('/') }
+                val peer = discoveredPeers.firstOrNull { it.name == wanted }
+                if (peer != null) {
+                    host = peer.host
+                    port = peer.port
+                } else {
+                    // Discovery has not seen it (yet). Say so instead of guessing
+                    // an address -- a wrong host fails later and less clearly.
+                    notifyUser(getString(R.string.msg_pairing_name_not_found, wanted))
+                    rescanPeers()
+                    return
+                }
+            }
             uri.startsWith(NEXUS_SCHEME) -> {
                 val authority = uri.removePrefix(NEXUS_SCHEME)
                     .substringBefore('?')
@@ -174,11 +242,10 @@ class MainActivity : ComponentActivity() {
     /**
      * Manual entry for a pairing code.
      *
-     * A camera-based scanner would need a camera permission plus a dependency,
-     * so the dialog accepts a pasted or typed `nexus://host:port` payload -- the
-     * exact string the desktop Receiver screen puts in its QR. This turns the
-     * previously dead scan button into a working control, and it is the same code
-     * path a real ML Kit scanner would feed.
+     * Kept as the fallback for the camera scanner: a peer whose camera is broken,
+     * or a code that arrived by email. Accepts a pasted or typed
+     * `nexus://host:port` payload -- the exact string the desktop Receiver screen
+     * puts in its QR.
      */
     private fun showPairingCodeDialog() {
         val input = android.widget.EditText(this).apply {
@@ -493,7 +560,8 @@ class MainActivity : ComponentActivity() {
                                         testConnection()
                                     },
                                     onRefreshPeers = { rescanPeers() },
-                                    onScanQr = { showPairingCodeDialog() },
+                                    onScanQr = { launchQrScanner() },
+                                    onManualPairingEntry = { showPairingCodeDialog() },
                                     sharedFiles = sharedFiles,
                                     sharedQueueIndex = sharedQueueIndex,
                                     onRemoveShared = { removeSharedFile(it) },
@@ -574,6 +642,16 @@ class MainActivity : ComponentActivity() {
                                         if (id != null && embeddedServer?.resumeIncoming(id) == true) {
                                             notifyUser(getString(R.string.msg_incoming_resumed))
                                         }
+                                    },
+                                    // Only while the endpoint is actually up:
+                                    // a QR for a dead receiver sends the sender
+                                    // straight into a connection failure.
+                                    pairingPayload = if (isReceiverRunning) {
+                                        buildPairingPayload(
+                                            deviceName.ifBlank { transferManager.getDeviceName() }
+                                        )
+                                    } else {
+                                        null
                                     },
                                     onCancelIncoming = {
                                         val id = incomingTransfer?.transferId

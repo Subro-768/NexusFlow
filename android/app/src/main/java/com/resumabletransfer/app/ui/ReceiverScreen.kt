@@ -27,6 +27,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
@@ -60,7 +62,9 @@ fun ReceiverScreen(
     onDeviceNameChange: (String) -> Unit = {},
     onPauseIncoming: () -> Unit = {},
     onResumeIncoming: () -> Unit = {},
-    onCancelIncoming: () -> Unit = {}
+    onCancelIncoming: () -> Unit = {},
+    /** `nexus://host:port` for this device, or null when it is not reachable. */
+    pairingPayload: String? = null
 ) {
     val context = LocalContext.current
 
@@ -593,6 +597,66 @@ fun ReceiverScreen(
                 }
             }
 
+            // 3b. Pairing code -- the thing the sender's scanner reads.
+            //
+            // The sender has always been able to scan a pairing code, but the
+            // Android receiver never drew one: the QR was removed along with the
+            // IP display, leaving the scan button nothing to aim at. The payload
+            // is the same `nexus://host:port` the Linux Hub encodes, so either
+            // device can be scanned by the other.
+            if (pairingPayload != null) {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = SoloraSurfaceCard,
+                    border = BorderStroke(1.dp, SoloraBorder),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.QrCodeScanner,
+                                contentDescription = null,
+                                tint = SoloraNeonLime,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                stringResource(R.string.receiver_pairing_code),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SoloraNeonLime
+                            )
+                        }
+
+                        val qrBitmap = remember(pairingPayload) { buildQrBitmap(pairingPayload) }
+                        if (qrBitmap != null) {
+                            Image(
+                                bitmap = qrBitmap.asImageBitmap(),
+                                contentDescription = stringResource(R.string.receiver_pairing_code),
+                                modifier = Modifier
+                                    .size(190.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(androidx.compose.ui.graphics.Color.White)
+                                    .padding(10.dp)
+                            )
+                        }
+
+                        Text(
+                            stringResource(R.string.receiver_pairing_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SoloraTextSecondary,
+                            textAlign = TextAlign.Center,
+                            lineHeight = 16.sp
+                        )
+                    }
+                }
+            }
+
             // 4. RECEIVED FILES LIST (Matches Linux)
             Surface(
                 shape = RoundedCornerShape(24.dp),
@@ -809,4 +873,28 @@ fun openFileWithSystemViewer(context: Context, file: File) {
     } catch (e: Exception) {
         Toast.makeText(context, "Could not open file: ${e.message}", Toast.LENGTH_SHORT).show()
     }
+}
+
+
+/**
+ * Encodes [payload] as a QR bitmap, or null if it cannot be drawn.
+ *
+ * Returns null rather than throwing: a pairing code is a convenience, and a
+ * failure to render one must not take the Receiver Hub down with it.
+ */
+private fun buildQrBitmap(payload: String, size: Int = 720): android.graphics.Bitmap? = try {
+    val matrix = com.google.zxing.qrcode.QRCodeWriter()
+        .encode(payload, com.google.zxing.BarcodeFormat.QR_CODE, size, size)
+    val pixels = IntArray(size * size)
+    for (y in 0 until size) {
+        val offset = y * size
+        for (x in 0 until size) {
+            pixels[offset + x] = if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+        }
+    }
+    android.graphics.Bitmap
+        .createBitmap(size, size, android.graphics.Bitmap.Config.ARGB_8888)
+        .also { it.setPixels(pixels, 0, size, 0, 0, size, size) }
+} catch (e: Exception) {
+    null
 }
