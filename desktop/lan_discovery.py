@@ -75,9 +75,19 @@ def broadcast_addresses() -> List[str]:
     """
     out = [_BROADCAST]
     try:
-        # Pass a dummy port so getaddrinfo returns proper (host, port) sockaddr
-        # tuples. With port=None the sockaddr entry is a bare string, and
-        # indexing [0] on it yields a character rather than an octet.
+        import subprocess
+        import re
+        out_bytes = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True)
+        for line in out_bytes.splitlines():
+            m = re.search(r"brd\s+([0-9.]+)", line)
+            if m:
+                brd = m.group(1)
+                if not brd.startswith("127."):
+                    out.append(brd)
+    except Exception:
+        pass
+
+    try:
         for info in socket.getaddrinfo(socket.gethostname(), 0, socket.AF_INET):
             addr = str(info[4][0])
             parts = addr.split(".")
@@ -85,6 +95,7 @@ def broadcast_addresses() -> List[str]:
                 out.append(".".join(parts[:3]) + ".255")
     except Exception:
         pass
+
     # Preserve order, drop duplicates.
     seen: Set[str] = set()
     unique = []
@@ -97,18 +108,40 @@ def broadcast_addresses() -> List[str]:
 
 def local_ip() -> str:
     """Best-guess local address, used as our own identity in announcements."""
+    # 1. Try ip route get
+    try:
+        import subprocess
+        import re
+        out = subprocess.check_output(["ip", "route", "get", "1.1.1.1"], text=True)
+        m = re.search(r"src\s+([0-9.]+)", out)
+        if m:
+            ip = m.group(1)
+            if not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    # 2. Try UDP probe
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        if not ip.startswith("127."):
+            return ip
     except Exception:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except Exception:
-            return "127.0.0.1"
+        pass
+
+    # 3. Try hostname
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    return "127.0.0.1"
 
 
 class _Responder(threading.Thread):
@@ -206,6 +239,9 @@ class _Responder(threading.Thread):
                 # Answer directly, then broadcast so passive listeners see us.
                 peer_host = addr[0]
                 if peer_host not in self.own_ips:
+                    # Reply directly to querying socket's port
+                    self._send(self._identity(), addr)
+                    # Also send to standard discovery port
                     self._send(self._identity(), (peer_host, DISCOVERY_PORT))
                 self._broadcast_hello()
             elif kind == "h":

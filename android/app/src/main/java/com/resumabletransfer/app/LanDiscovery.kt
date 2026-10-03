@@ -3,390 +3,363 @@ package com.resumabletransfer.app
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.Inet4Address
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.NetworkInterface
-import java.net.SocketTimeoutException
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
 
 /**
- * UDP broadcast peer discovery for NexusFlow.
+ * LanDiscovery — UDP broadcast peer discovery.
  *
- * ## Why this exists
+ * WHY NOT mDNS?
+ * Android's SoftAP (hotspot) does NOT forward multicast packets between
+ * Wi-Fi clients. NsdManager / mDNS silently finds nothing when two
+ * devices share a phone hotspot. UDP *broadcast* to 255.255.255.255 IS
+ * delivered locally by the IP stack on every device, so it works there.
  *
- * `NsdManager`/mDNS does not work on an Android hotspot. SoftAP does not
- * forward multicast between the AP interface and clients, so the two devices
- * never see each other's mDNS announcements. This was the actual cause of
- * "device not showing up when both are on my phone's hotspot".
+ * Wire protocol (identical to desktop/lan_discovery.py):
+ *   query → {"t":"q"}
+ *   hello → {"t":"h","n":<name>,"p":<port>,"v":1,"id":<own_ip>}
  *
- * UDP *broadcast* is handled by the local link and does traverse a hotspot:
- * the phone receives it locally (it is the gateway) and the responder socket is
- * bound to `0.0.0.0`. So broadcast is the primary mechanism here, with
- * [com.resumabletransfer.app.NsdHelper] still contributing peers on a real LAN
- * where mDNS is cheap and reliable.
- *
- * ## Wire protocol
- *
- * Identical to `desktop/lan_discovery.py`, so phone and desktop interoperate:
- *  - query `{"t":"q"}`
- *  - hello  `{"t":"h","n":name,"p":port,"v":1,"id":ip}`
+ * Port: 47777 (distinct from HTTP transfer port 8000)
  */
 object LanDiscovery {
 
     private const val TAG = "LanDiscovery"
-
-    /** Kept in sync with the desktop implementation. */
-    private const val DISCOVERY_PORT = 47777
+    const val DISCOVERY_PORT = 47777
+    private const val SCAN_INTERVAL_MS  = 4_000L
     private const val ANNOUNCE_INTERVAL_MS = 3_000L
-    private const val SCAN_INTERVAL_MS = 4_000L
-    private const val PEER_TIMEOUT_MS = 12_000L
-    private const val QUERY_RECV_WINDOW_MS = 1_200
+    private const val PEER_TIMEOUT_MS   = 15_000L
 
+    /** A peer discovered on the LAN. */
     data class LanPeer(
         val name: String,
         val host: String,
         val port: Int,
-        val key: String
-    ) {
-        override fun toString(): String = "LanPeer($name@$host:$port)"
+        val key: String,
+        val lastSeen: Long = System.currentTimeMillis()
+    )
+
+    // ── Public callbacks ───────────────────────────────────────────────────────
+
+    /** Called on a background thread whenever the peer list changes. */
+    @Volatile var onPeersChanged: ((List<LanPeer>) -> Unit)? = null
+
+    // ── Internal state ─────────────────────────────────────────────────────────
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    private var scanJob: Job? = null
+    private var advertiseJob: Job? = null
+    private var listenJob: Job? = null
+
+    private val peerMap = mutableMapOf<String, LanPeer>()
+    private val peerLock = Any()
+
+    @Volatile private var ownIps: Set<String> = emptySet()
+    @Volatile private var deviceName: String = "NexusFlow Device"
+    @Volatile private var servicePort: Int = 8000
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    // ── Public API ─────────────────────────────────────────────────────────────
+
+    fun startAdvertising(context: Context, name: String, port: Int) {
+        acquireMulticastLock(context)
+        deviceName = name.ifBlank { "NexusFlow Device" }
+        servicePort = port
+        ownIps = getOwnIps(context)
+        stopAdvertise()
+
+        // Periodic hello broadcasts
+        advertiseJob = scope.launch {
+            Log.i(TAG, "Advertising '$deviceName' on port $servicePort, ownIps=$ownIps")
+            while (isActive) {
+                broadcastHello()
+                delay(ANNOUNCE_INTERVAL_MS)
+            }
+        }
+        ensureListener()
     }
 
-    // ── state ────────────────────────────────────────────────────────────
-    private val peers = ConcurrentHashMap<String, Pair<LanPeer, Long>>()
-    private val ownIps = mutableSetOf<String>()
+    fun stopAdvertising() = stopAdvertise()
 
-    private var responderRunning = AtomicBoolean(false)
-    private var scannerRunning = AtomicBoolean(false)
-    private var wakeLock: WifiManager.MulticastLock? = null
-
-    /** Fired (on a background thread) when the peer list changes. */
-    @Volatile
-    var onPeersChanged: ((List<LanPeer>) -> Unit)? = null
-
-    val isAdvertising: Boolean get() = responderRunning.get()
-    val isScanning: Boolean get() = scannerRunning.get()
-
-    // ── addressing helpers ───────────────────────────────────────────────
-
-    /** This device's address on the interface that can reach peers. */
-    fun localIp(): String {
-        // Prefer the hotspot-facing / wlan address over cellular.
-        try {
-            NetworkInterface.getNetworkInterfaces()?.toList()
-                ?.filter { it.isUp && !it.isLoopback }
-                ?.sortedBy { if (it.name.startsWith("wlan")) 0 else 1 }
-                ?.forEach { nic ->
-                    val addr = nic.inetAddresses.toList()
-                        .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
-                        ?.hostAddress
-                    if (addr != null && !addr.startsWith("127.")) return addr
-                }
-        } catch (e: Exception) {
-            Log.w(TAG, "localIp enumeration failed: ${e.message}")
+    fun startScanning(context: Context) {
+        acquireMulticastLock(context)
+        ownIps = getOwnIps(context)
+        clearPeers()
+        scanJob?.cancel()
+        scanJob = scope.launch {
+            Log.i(TAG, "LAN scan started (ownIps=$ownIps)")
+            while (isActive) {
+                sendQuery()
+                delay(SCAN_INTERVAL_MS)
+                evictStale()
+            }
         }
-        return "127.0.0.1"
+        ensureListener()
     }
 
-    /** Limited broadcast plus each interface's directed subnet broadcast. */
-    private fun broadcastTargets(): List<String> {
-        val out = mutableListOf("255.255.255.255")
-        try {
-            NetworkInterface.getNetworkInterfaces()?.toList()
-                ?.filter { it.isUp && !it.isLoopback }
-                ?.forEach { nic ->
-                    val v4 = nic.inetAddresses.toList().filterIsInstance<Inet4Address>()
-                    v4.firstOrNull()?.let { a ->
-                        val parts = a.hostAddress?.split(".") ?: return@forEach
-                        if (parts.size == 4 && !a.hostAddress.startsWith("127.")) {
-                            out.add(parts.subList(0, 3).joinToString(".") + ".255")
-                        }
-                    }
-                }
-        } catch (e: Exception) {
-            Log.w(TAG, "broadcast enumeration failed: ${e.message}")
-        }
-        return out.distinct()
+    fun stopScanning() {
+        scanJob?.cancel(); scanJob = null
+        listenJob?.cancel(); listenJob = null
+        releaseMulticastLock()
     }
 
-    private fun identity(name: String, servicePort: Int): JSONObject =
-        JSONObject().apply {
-            put("t", "h")
-            put("n", name)
-            put("p", servicePort)
-            put("v", 1)
-            put("id", localIp())
-        }
-
-    /**
-     * Acquires a multicast lock.
-     *
-     * Not strictly needed for broadcast, but cheap insurance: some WiFi chips in
-     * power-save mode drop broadcast frames the same way they drop multicast.
-     */
     private fun acquireMulticastLock(context: Context) {
         try {
-            val wm = context.applicationContext
-                .getSystemService(Context.WIFI_SERVICE) as WifiManager
-            wakeLock = wm.createMulticastLock("nexusflow-lan")
-            wakeLock?.setReferenceCounted(false)
-            wakeLock?.acquire()
+            if (multicastLock == null) {
+                val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                multicastLock = wm?.createMulticastLock("nexusflow_lan_lock")?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            multicastLock?.let {
+                if (!it.isHeld) it.acquire()
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "multicast lock unavailable: ${e.message}")
+            Log.w(TAG, "acquireMulticastLock: ${e.message}")
         }
     }
 
     private fun releaseMulticastLock() {
         try {
-            wakeLock?.release()
+            multicastLock?.let {
+                if (it.isHeld) it.release()
+            }
         } catch (e: Exception) {
-            // already released
+            Log.w(TAG, "releaseMulticastLock: ${e.message}")
         }
-        wakeLock = null
     }
 
-    // ── responder (receiver side) ────────────────────────────────────────
+    /** Trigger an immediate scan query. Used by the Refresh button. */
+    fun scanNow() = scope.launch { sendQuery() }
+
+    fun getPeers(): List<LanPeer> = synchronized(peerLock) { peerMap.values.toList() }
+
+    fun destroy() {
+        stopAdvertise()
+        stopScanning()
+    }
+
+    // ── Networking helpers ─────────────────────────────────────────────────────
+
+    private fun stopAdvertise() {
+        advertiseJob?.cancel(); advertiseJob = null
+    }
 
     /**
-     * Start announcing this device. Call when the receiver is enabled.
-     *
-     * Binds to `0.0.0.0` so it answers on the hotspot interface too, not just
-     * the primary one.
+     * Build the list of our own IPv4 addresses.
+     * Uses WifiManager for the primary Wi-Fi address plus NetworkInterface
+     * enumeration so hotspot/AP and VPN addresses are also included.
      */
-    fun startAdvertising(context: Context, deviceName: String, servicePort: Int): Boolean {
-        stopAdvertising()
-        ownIps.clear()
-        ownIps.add(localIp())
-        acquireMulticastLock(context)
-        responderRunning.set(true)
+    private fun getOwnIps(context: Context): Set<String> {
+        val result = mutableSetOf<String>()
+        // WifiManager gives us the active Wi-Fi address quickly
+        try {
+            val wm = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val wifiInfo = wm.connectionInfo
+            val ipInt = wifiInfo?.ipAddress ?: 0
+            if (ipInt != 0) {
+                val ip = String.format(
+                    "%d.%d.%d.%d",
+                    ipInt and 0xff, (ipInt shr 8) and 0xff,
+                    (ipInt shr 16) and 0xff, (ipInt shr 24) and 0xff
+                )
+                result += ip
+            }
+        } catch (_: Exception) {}
+        // NetworkInterface covers hotspot/AP interface, USB tethering, etc.
+        try {
+            for (iface in NetworkInterface.getNetworkInterfaces() ?: return result) {
+                if (!iface.isUp || iface.isLoopback) continue
+                for (addr in iface.inetAddresses) {
+                    if (addr.isLoopbackAddress) continue
+                    val ip = addr.hostAddress ?: continue
+                    if (ip.contains(":")) continue  // skip IPv6
+                    result += ip
+                }
+            }
+        } catch (_: Exception) {}
+        Log.d(TAG, "Own IPs: $result")
+        return result
+    }
 
-        thread(name = "nexusflow-lan-responder", isDaemon = true) {
-            // The responder owns DISCOVERY_PORT; the scanner uses ephemeral ports, so
-        // the two never contend for the same number. Binding the wildcard
-        // address matters on a hotspot, where the reachable address is the
-        // SoftAP one rather than the primary interface.
-        val sock = DatagramSocket(DISCOVERY_PORT, InetAddress.getByName("0.0.0.0"))
-            try {
+    /** Broadcast addresses to try: limited + directed subnet. */
+    private fun broadcastTargets(): List<String> {
+        val out = mutableListOf("255.255.255.255")
+        for (ip in ownIps) {
+            val parts = ip.split(".")
+            if (parts.size == 4 && !ip.startsWith("127.")) {
+                out += "${parts[0]}.${parts[1]}.${parts[2]}.255"
+            }
+        }
+        try {
+            val nics = java.util.Collections.list(NetworkInterface.getNetworkInterfaces())
+            for (nic in nics) {
+                if (!nic.isUp || nic.isLoopback) continue
+                for (ia in nic.interfaceAddresses) {
+                    val bcast = ia.broadcast?.hostAddress
+                    if (bcast != null && !bcast.startsWith("127.")) {
+                        out.add(bcast)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return out.distinct()
+    }
+
+    private fun myHello(): String {
+        val ownIp = ownIps.firstOrNull { !it.startsWith("127.") } ?: "127.0.0.1"
+        return JSONObject()
+            .put("t", "h")
+            .put("n", deviceName)
+            .put("p", servicePort)
+            .put("v", 1)
+            .put("id", ownIp)
+            .toString()
+    }
+
+    private fun broadcastHello() {
+        val hello = myHello().toByteArray(Charsets.UTF_8)
+        try {
+            DatagramSocket().use { sock ->
                 sock.broadcast = true
-                sock.soTimeout = 1000
-
-                val payload = identity(deviceName, servicePort).toString().toByteArray()
-                var nextAnnounce = 0L
-
-                while (responderRunning.get()) {
-                    val now = System.currentTimeMillis()
-                    if (now >= nextAnnounce) {
-                        for (target in broadcastTargets()) {
-                            try {
-                                sock.send(
-                                    DatagramPacket(
-                                        payload, payload.size,
-                                        InetAddress.getByName(target), DISCOVERY_PORT
-                                    )
-                                )
-                            } catch (e: Exception) {
-                                // A single unreachable broadcast address is fine.
-                            }
-                        }
-                        nextAnnounce = now + ANNOUNCE_INTERVAL_MS
+                for (addr in broadcastTargets()) {
+                    runCatching {
+                        sock.send(DatagramPacket(
+                            hello, hello.size,
+                            InetAddress.getByName(addr), DISCOVERY_PORT
+                        ))
                     }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "broadcastHello error: ${e.message}")
+        }
+    }
 
-                    val buf = ByteArray(4096)
-                    val packet = DatagramPacket(buf, buf.size)
+    private fun sendQuery() {
+        val query = JSONObject().put("t", "q").toString().toByteArray(Charsets.UTF_8)
+        try {
+            DatagramSocket().use { sock ->
+                sock.broadcast = true
+                sock.soTimeout = 1500
+                for (addr in broadcastTargets()) {
+                    runCatching {
+                        sock.send(DatagramPacket(
+                            query, query.size,
+                            InetAddress.getByName(addr), DISCOVERY_PORT
+                        ))
+                    }
+                }
+                // Short receive window to pick up direct replies
+                val buf = ByteArray(4096)
+                val deadline = System.currentTimeMillis() + 1500
+                while (System.currentTimeMillis() < deadline) {
+                    val pkt = DatagramPacket(buf, buf.size)
                     try {
-                        sock.receive(packet)
-                    } catch (e: SocketTimeoutException) {
-                        continue
-                    } catch (e: Exception) {
-                        break
-                    }
+                        sock.receive(pkt)
+                        handleMsg(String(pkt.data, 0, pkt.length), pkt.address?.hostAddress ?: "", sock)
+                    } catch (_: java.net.SocketTimeoutException) { break }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "sendQuery error: ${e.message}")
+        }
+    }
 
-                    val msg = runCatching {
-                        JSONObject(String(packet.data, 0, packet.length))
-                    }.getOrNull() ?: continue
-
-                    when (msg.optString("t")) {
-                        "q" -> {
-                            val from = packet.address?.hostAddress
-                            // Reply unicast to the asker, then broadcast so any
-                            // passive listener also learns about us.
-                            if (from != null && from !in ownIps) {
-                                runCatching {
-                                    sock.send(
-                                        DatagramPacket(
-                                            payload, payload.size,
-                                            InetAddress.getByName(from), DISCOVERY_PORT
-                                        )
-                                    )
-                                }
-                            }
-                            for (target in broadcastTargets()) {
-                                runCatching {
-                                    sock.send(
-                                        DatagramPacket(
-                                            payload, payload.size,
-                                            InetAddress.getByName(target), DISCOVERY_PORT
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                        "h" -> {
-                            val from = packet.address?.hostAddress
-                            val host = msg.optString("id").ifBlank { from ?: "" }
-                            if (host.isBlank()) continue
-                            if (host in ownIps || (from != null && from in ownIps)) continue
-                            val peer = LanPeer(
-                                name = msg.optString("n").ifBlank { host },
-                                host = host,
-                                port = msg.optInt("p", 8000),
-                                key = "${msg.optString("n")}|$host"
-                            )
-                            val changed = notePeer(peer)
-                            if (changed) fire()
-                        }
+    /** Start the permanent listener (idempotent). */
+    private fun ensureListener() {
+        if (listenJob?.isActive == true) return
+        listenJob = scope.launch {
+            Log.i(TAG, "UDP listener starting on port $DISCOVERY_PORT")
+            try {
+                DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(java.net.InetSocketAddress(DISCOVERY_PORT))
+                    broadcast = true
+                    soTimeout = 2000
+                }.use { sock ->
+                    val buf = ByteArray(4096)
+                    while (isActive) {
+                        val pkt = DatagramPacket(buf, buf.size)
+                        try {
+                            sock.receive(pkt)
+                        } catch (_: java.net.SocketTimeoutException) { continue }
+                        handleMsg(
+                            String(pkt.data, 0, pkt.length),
+                            pkt.address?.hostAddress ?: "",
+                            sock
+                        )
                     }
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "responder stopped: ${e.message}")
-            } finally {
-                runCatching { sock.close() }
+                Log.w(TAG, "UDP listener exited: ${e.message}")
             }
         }
-        Log.i(TAG, "Advertising '$deviceName' on port $servicePort")
-        return true
     }
 
-    fun stopAdvertising() {
-        responderRunning.set(false)
-        releaseMulticastLock()
-    }
-
-    // ── browser (sender side) ────────────────────────────────────────────
-
-    /** Start scanning for peers in the background. */
-    fun startScanning(context: Context) {
-        stopScanning()
-        ownIps.clear()
-        ownIps.add(localIp())
-        acquireMulticastLock(context)
-        scannerRunning.set(true)
-
-        thread(name = "nexusflow-lan-scan", isDaemon = true) {
-            while (scannerRunning.get()) {
-                scanOnce()
-                expireStale()
-                try {
-                    Thread.sleep(SCAN_INTERVAL_MS)
-                } catch (e: InterruptedException) {
-                    return@thread
+    private fun handleMsg(text: String, senderIp: String, sock: DatagramSocket) {
+        val msg = try { JSONObject(text) } catch (_: Exception) { return }
+        when (msg.optString("t")) {
+            "q" -> {
+                // Someone is asking "who's out there?"
+                if (advertiseJob?.isActive == true && senderIp !in ownIps) {
+                    val hello = myHello().toByteArray(Charsets.UTF_8)
+                    runCatching {
+                        sock.send(DatagramPacket(
+                            hello, hello.size,
+                            InetAddress.getByName(senderIp), DISCOVERY_PORT
+                        ))
+                    }
+                    broadcastHello()
+                }
+            }
+            "h" -> {
+                val host = msg.optString("id").ifBlank { senderIp }
+                if (host in ownIps || senderIp in ownIps) return
+                val name = msg.optString("n").ifBlank { host }
+                val port = msg.optInt("p", 8000)
+                val key  = "${name}|${host}"
+                val peer = LanPeer(name, host, port, key)
+                var changed = false
+                synchronized(peerLock) {
+                    if (peerMap[key] == null || peerMap[key]!!.lastSeen < peer.lastSeen) {
+                        peerMap[key] = peer
+                        changed = true
+                    }
+                }
+                if (changed) {
+                    Log.i(TAG, "LAN peer: $name @ $host:$port")
+                    onPeersChanged?.invoke(getPeers())
                 }
             }
         }
-        Log.i(TAG, "Scanning for peers on $DISCOVERY_PORT")
     }
 
-    fun stopScanning() {
-        scannerRunning.set(false)
-        releaseMulticastLock()
-    }
-
-    /** Immediate query, used by the Refresh button. */
-    fun scanNow() {
-        thread(name = "nexusflow-lan-scan-now", isDaemon = true) { scanOnce() }
-    }
-
-    private fun scanOnce() {
-        val sock = DatagramSocket()
-        try {
-            sock.broadcast = true
-            sock.soTimeout = 300
-            val query = JSONObject().put("t", "q").toString().toByteArray()
-            for (target in broadcastTargets()) {
-                runCatching {
-                    sock.send(
-                        DatagramPacket(
-                            query, query.size, InetAddress.getByName(target), DISCOVERY_PORT
-                        )
-                    )
-                }
-            }
-
-            var changed = false
-            val deadline = System.currentTimeMillis() + QUERY_RECV_WINDOW_MS
-            val buf = ByteArray(4096)
-            while (System.currentTimeMillis() < deadline) {
-                val packet = DatagramPacket(buf, buf.size)
-                try {
-                    sock.receive(packet)
-                } catch (e: SocketTimeoutException) {
-                    continue
-                } catch (e: Exception) {
-                    break
-                }
-                val msg = runCatching {
-                    JSONObject(String(packet.data, 0, packet.length))
-                }.getOrNull() ?: continue
-                if (msg.optString("t") != "h") continue
-
-                val from = packet.address?.hostAddress
-                val host = msg.optString("id").ifBlank { from ?: "" }
-                if (host.isBlank()) continue
-                if (host in ownIps || (from != null && from in ownIps)) continue
-
-                val peer = LanPeer(
-                    name = msg.optString("n").ifBlank { host },
-                    host = host,
-                    port = msg.optInt("p", 8000),
-                    key = "${msg.optString("n")}|$host"
-                )
-                if (notePeer(peer)) changed = true
-            }
-            if (changed) fire()
-        } catch (e: Exception) {
-            Log.w(TAG, "scan failed: ${e.message}")
-        } finally {
-            runCatching { sock.close() }
-        }
-    }
-
-    private fun notePeer(peer: LanPeer): Boolean {
-        val previous = peers[peer.key]
-        peers[peer.key] = peer to System.currentTimeMillis()
-        return previous?.first?.host != peer.host
-    }
-
-    private fun expireStale() {
+    private fun evictStale() {
         val cutoff = System.currentTimeMillis() - PEER_TIMEOUT_MS
         var changed = false
-        val it = peers.entries.iterator()
-        while (it.hasNext()) {
-            val entry = it.next()
-            if (entry.value.second < cutoff) {
-                it.remove()
-                changed = true
-            }
+        synchronized(peerLock) {
+            val stale = peerMap.keys.filter { (peerMap[it]?.lastSeen ?: 0) < cutoff }
+            stale.forEach { peerMap.remove(it); changed = true }
+            if (changed) {}
         }
-        if (changed) fire()
+        if (changed) onPeersChanged?.invoke(getPeers())
     }
 
-    private fun fire() {
-        onPeersChanged?.invoke(getPeers())
+    private fun clearPeers() {
+        synchronized(peerLock) {
+            peerMap.clear()
+        }
+        onPeersChanged?.invoke(emptyList())
     }
-
-    fun getPeers(): List<LanPeer> =
-        peers.values.map { it.first }.sortedBy { it.name }
-
-    fun clearPeers() {
-        peers.clear()
-    }
-
-    /** Maps a broadcast peer onto the shared [PeerDevice] shape the UI uses. */
-    fun PeerDevice(name: String, host: String, port: Int) =
-        com.resumabletransfer.app.PeerDevice(name, host, port)
 }

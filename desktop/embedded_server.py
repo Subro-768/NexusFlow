@@ -80,6 +80,7 @@ class EmbeddedReceiverServer:
         self.server: Optional[ThreadedHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
         self.is_running = False
+        self.device_name: str = "NexusFlow Device"
         
         # In-memory transfer records
         self._transfers_lock = threading.Lock()
@@ -202,6 +203,8 @@ class EmbeddedReceiverServer:
                         payload = {
                             "status": "online",
                             "service": "nexus-linux-receiver",
+                            "device_name": parent.device_name,
+                            "name": parent.device_name,
                             "version": "1.0.0"
                         }
                         self.wfile.write(json.dumps(payload).encode())

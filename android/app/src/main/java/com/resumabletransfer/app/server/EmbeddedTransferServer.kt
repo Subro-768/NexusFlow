@@ -164,11 +164,15 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
         }
     }
 
+    @Volatile var deviceName: String = "Android Device"
+
     private fun handleHealth(output: OutputStream) {
         val ips = getLocalIpAddresses()
         val json = JSONObject().apply {
             put("status", "ok")
             put("service", "nexus-flow-android-receiver")
+            put("device_name", deviceName)
+            put("name", deviceName)
             put("local_ips", JSONArray(ips))
         }
         sendJson(output, 200, json)

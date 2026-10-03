@@ -40,8 +40,8 @@ DEFAULT_PORTS = (8000,)
 #: Concurrency. 256 completes a /24 in well under half a second.
 CONCURRENCY = 256
 
-#: Per-attempt connect timeout. Short, because most addresses are dead.
-CONNECT_TIMEOUT = 0.25
+#: Per-attempt connect timeout. 0.35s is robust for mobile hotspots.
+CONNECT_TIMEOUT = 0.35
 
 #: Seconds allowed for the HTTP identity probe once a port is open.
 HEALTH_TIMEOUT = 1.5
@@ -55,9 +55,45 @@ def local_ipv4() -> Optional[str]:
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        if not ip.startswith("127."):
+            return ip
     except Exception:
-        return None
+        pass
+
+    try:
+        import subprocess
+        import re
+        out = subprocess.check_output(["ip", "route", "get", "1.1.1.1"], text=True)
+        m = re.search(r"src\s+([0-9.]+)", out)
+        if m:
+            ip = m.group(1)
+            if not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    try:
+        import subprocess
+        out = subprocess.check_output(["ip", "-4", "-br", "addr"], text=True)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                iface, addr_cidr = parts[0], parts[2]
+                if not iface.startswith(("lo", "docker", "virbr", "wg", "tun")):
+                    ip = addr_cidr.split("/")[0]
+                    if not ip.startswith("127."):
+                        return ip
+    except Exception:
+        pass
+
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    return None
 
 
 def _probe(ip: str, ports: Tuple[int, ...], timeout: float) -> Optional[Tuple[str, int, Optional[dict]]]:

@@ -37,8 +37,8 @@ object SubnetScanner {
 
     private const val TAG = "SubnetScanner"
     private const val TRANSFER_PORT = 8000
-    private const val CONNECT_TIMEOUT_MS = 250
-    private const val HEALTH_TIMEOUT_MS = 1200
+    private const val CONNECT_TIMEOUT_MS = 350
+    private const val HEALTH_TIMEOUT_MS = 1500
 
     /** Ceiling on simultaneously open sockets; higher risks FD exhaustion. */
     private const val CONCURRENCY = 192
@@ -63,16 +63,47 @@ object SubnetScanner {
 
     private fun localIPv4(): String? {
         return try {
-            NetworkInterface.getNetworkInterfaces()?.toList()
-                ?.filter { it.isUp && !it.isLoopback }
-                ?.sortedBy { if (it.name.startsWith("wlan")) 0 else 1 }
-                ?.forEach { nic ->
-                    val addr = nic.inetAddresses.toList()
-                        .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
-                    if (addr != null && !addr.hostAddress.startsWith("127.")) {
-                        return addr.hostAddress
+            val nics = NetworkInterface.getNetworkInterfaces()?.toList() ?: return null
+            // Prioritize local Wi-Fi and Hotspot interfaces (wlan, ap, rndis, swlan)
+            val sortedNics = nics.filter { it.isUp && !it.isLoopback }
+                .sortedBy { nic ->
+                    val name = nic.name.lowercase()
+                    when {
+                        name.startsWith("ap") -> 0       // Hotspot / SoftAP
+                        name.startsWith("wlan") -> 1     // Wi-Fi client
+                        name.startsWith("rndis") -> 2    // USB tethering
+                        name.startsWith("swlan") -> 3
+                        name.startsWith("eth") -> 4
+                        else -> 10                       // Mobile data (rmnet, etc.)
                     }
                 }
+
+            for (nic in sortedNics) {
+                for (addr in nic.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        val host = addr.hostAddress ?: continue
+                        if (!host.startsWith("127.")) {
+                            // Check if it's a private network address
+                            if (host.startsWith("192.168.") || host.startsWith("10.") ||
+                                host.matches(Regex("^172\\.(1[6-9]|2[0-9]|3[0-1])\\..*"))) {
+                                return host
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: any non-loopback IPv4
+            for (nic in sortedNics) {
+                for (addr in nic.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        val host = addr.hostAddress ?: continue
+                        if (!host.startsWith("127.")) {
+                            return host
+                        }
+                    }
+                }
+            }
             null
         } catch (e: Exception) {
             Log.w(TAG, "localIPv4 failed: ${e.message}")

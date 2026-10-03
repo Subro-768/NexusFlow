@@ -482,6 +482,7 @@ class MainActivity : ComponentActivity() {
                                                 // by name. The address is never shown on
                                                 // screen -- peers resolve it over mDNS.
                                                 val name = deviceName.ifBlank { transferManager.getDeviceName() }
+                                                embeddedServer?.deviceName = name
                                                 nsdHelper?.registerService(name, DEFAULT_PORT)
                                                 // Also announce over UDP broadcast. mDNS does
                                                 // NOT traverse an Android hotspot, so without
@@ -761,20 +762,22 @@ class MainActivity : ComponentActivity() {
                 isDiscovering = false
             }
         }
+
+        // Also start TCP subnet scan for hotspots that drop both mDNS and UDP broadcast
+        startSubnetScan()
     }
 
-    /** Refresh button: query both discovery mechanisms immediately. */
+    /** Refresh button: query all discovery mechanisms immediately. */
     private fun rescanPeers() {
         LanDiscovery.scanNow()
         nsdHelper?.startDiscovery(
             embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
         )
         isDiscovering = true
+        startSubnetScan()
+    }
 
-        // TCP subnet probe. On the target network neither multicast nor
-        // broadcast is relayed by the AP, but unicast is -- so asking each
-        // address directly is the only mechanism that finds anything. The local
-        // /24 resolves in under a second; the rest streams in behind it.
+    private fun startSubnetScan() {
         SubnetScanner.onFound = { peer ->
             val device = PeerDevice(peer.deviceName, peer.ip, peer.port)
             lifecycleScope.launch {

@@ -1007,6 +1007,7 @@ class SenderScreen(QWidget):
         self.discovery_working = self.lan_ok or self.discovery_ok
         self._peer_signature = None
         self.refresh_nearby_devices_ui()
+        self.start_subnet_scan()
 
     def _on_lan_peers(self, peers):
         """Called from the LAN discovery background thread.
@@ -1042,6 +1043,8 @@ class SenderScreen(QWidget):
                 )
         except Exception:
             pass
+        self.lbl_scanning.setText("● Scanning...")
+        self.lbl_scanning.setStyleSheet(f"color: {SOLORA_AMBER}; font-size: {FS_META_SM};")
         self._peer_signature = None  # force a rebuild
         self.refresh_nearby_devices_ui()
         self.start_subnet_scan()
@@ -1262,7 +1265,7 @@ class SenderScreen(QWidget):
         btn_refresh_nearby.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_CYAN}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: {FS_META_SM};")
         btn_refresh_nearby.setToolTip("Refresh nearby devices")
         btn_refresh_nearby.setAccessibleName("Refresh nearby devices")
-        btn_refresh_nearby.clicked.connect(self.refresh_nearby_devices_ui)
+        btn_refresh_nearby.clicked.connect(self.refresh_peers_now)
         nearby_title_row.addWidget(btn_refresh_nearby)
 
         # Pairing-code paste button. The old "📷" button opened a dialog telling
@@ -2418,6 +2421,7 @@ class ReceiverScreen(QWidget):
                 # Register NSD service with device name so senders can discover this PC
                 name = self.txt_device_name.text().strip() or socket.gethostname()
                 self._device_name = name
+                self.server.device_name = name
                 if nsd_advertiser:
                     nsd_advertiser.start(device_name=name, port=8000)
                 # Also announce over UDP broadcast. mDNS does not traverse an
@@ -2909,8 +2913,25 @@ class NexusFlowLinuxApp(QMainWindow):
         """)
 
 
+class _TooltipSuppressor(QObject):
+    """Swallows hover tooltips app-wide.
+
+    The app called setToolTip() on two dozen widgets, several of them created at
+    runtime (peer cards, per-IP test buttons). Editing each call site would miss
+    the dynamic ones and leave the behaviour half-removed, so this filters the
+    event instead: returning True consumes it and no tooltip is ever shown.
+    """
+
+    # Parameter names match PyQt6's stub so the override type-checks.
+    def eventFilter(self, a0, a1):
+            if a1.type() == QEvent.Type.ToolTip:
+                return True
+            return False
+
+
 def main():
     app = QApplication(sys.argv)
+    app.installEventFilter(_TooltipSuppressor())
     window = NexusFlowLinuxApp()
     window.show()
     sys.exit(app.exec())
