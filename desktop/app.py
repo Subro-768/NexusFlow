@@ -1444,7 +1444,7 @@ class SenderScreen(QWidget):
 
         self.lbl_log_dot = QLabel("●")
         self.lbl_log_dot.setStyleSheet(f"color: {SOLORA_ENERGY_GREEN}; font-size: {FS_HEADING}; background: transparent;")
-        self.lbl_log = QLabel("Ready to initiate high-speed data transfer.")
+        self.lbl_log = QLabel("")
         self.lbl_log.setStyleSheet(f"color: {SOLORA_TEXT_PRIMARY}; font-size: {FS_BODY_SM}; font-weight: 600; letter-spacing: 0.5px; background: transparent;")
         # Item 23: long SHA / error strings were pushed into a fixed-height box and
         # clipped. Wrap instead, and keep the full text as a tooltip.
@@ -1454,6 +1454,8 @@ class SenderScreen(QWidget):
         lbl_box_layout.addWidget(self.lbl_log_dot)
         lbl_box_layout.addWidget(self.lbl_log, 1)
         pl.addWidget(log_box)
+        self.log_box = log_box
+        self.log_box.setVisible(False)   # nothing to say until something happens
         layout.addWidget(pc)
 
         # Buttons
@@ -1550,7 +1552,7 @@ class SenderScreen(QWidget):
         self.txt_peer_name.setText(target.host)
         self.txt_port.setText(str(target.port))
         label = target.name or target.host
-        self.lbl_log.setText(f"Paired with '{label}' at {target.host}:{target.port}.")
+        self._set_log(f"Paired with '{label}' at {target.host}:{target.port}.")
         self.test_connection()
         return True
 
@@ -1844,7 +1846,7 @@ class SenderScreen(QWidget):
             self.lbl_conn.setText(f"{message} — {detail}" if detail else message)
             self.lbl_conn.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-weight: bold;")
             self.lbl_conn.setToolTip(detail)
-            self.lbl_log.setText(
+            self._set_log(
                 f"⚠ {self.txt_peer_name.text().strip()}:{self.txt_port.text().strip()} "
                 f"is not reachable ({detail}). Check the port, the IP, and that "
                 f"'ENABLE RECEIVING' is on at the other end."
@@ -1867,17 +1869,35 @@ class SenderScreen(QWidget):
         except OSError as exc:
             self.lbl_badge.setText("UNREADABLE")
             self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ALERT_RED, SOLORA_BG))
-            self.lbl_log.setText(f"⚠ Cannot read {path}: {type(exc).__name__}: {exc}")
+            self._set_log(f"⚠ Cannot read {path}: {type(exc).__name__}: {exc}")
             return
         # Item 23: elide the path, keep the full value as a tooltip.
         self.lbl_file.setText(elide(os.path.basename(path), self.lbl_file))
         self.lbl_file.setToolTip(path)
         self.lbl_vol.setText(f"0 B / {format_size(sz)} (0%)")
-        self.lbl_log.setText(f"Ready to transfer {os.path.basename(path)} ({format_size(sz)})")
+        # Deliberately no "Ready to transfer <name> (<size>)" line here: the card
+        # directly above already prints the name, the size and the 0%, so the
+        # banner restated all three. It is hidden instead of emptied, because an
+        # empty bordered box reads as a broken widget.
+        self._set_log("")
         self.btn_start.setEnabled(True)
         self.btn_start.setText("▶  START TRANSFER")
         self.btn_clear.setEnabled(True)
         self.prog_bar.setValue(0)
+
+    def _set_log(self, message: str):
+        """Show the status banner with `message`, or hide it when nothing to say.
+
+        Every real event -- connecting, resuming, an error -- still goes here.
+        Only the redundant chatter is suppressed, and hiding the whole banner
+        beats leaving an empty bordered box on screen.
+        """
+        if message:
+            self.lbl_log.setText(message)
+            self.log_box.setVisible(True)
+        else:
+            self.lbl_log.setText("")
+            self.log_box.setVisible(False)
 
     def clear_file(self):
         """Put the file back to "NO FILE SELECTED" without sending it.
@@ -1900,7 +1920,7 @@ class SenderScreen(QWidget):
         self.lbl_badge.setText("STANDBY")
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_SURFACE_ELEVATED, SOLORA_TEXT_SECONDARY))
         self.prog_bar.setValue(0)
-        self.lbl_log.setText("File removed. Nothing is selected.")
+        self._set_log("")
 
         self.btn_start.setEnabled(False)
         self.btn_start.setText("▶  START TRANSFER")
@@ -1971,16 +1991,16 @@ class SenderScreen(QWidget):
         # INTERRUPTED badge, clobbering the PAUSED state immediately.
         worker = self.active_worker
         if worker is None or not worker.isRunning():
-            self.lbl_log.setText("Nothing is running to pause.")
+            self._set_log("Nothing is running to pause.")
             return
         try:
             worker.client.pause()
         except Exception as exc:
-            self.lbl_log.setText(f"⚠ Could not pause: {type(exc).__name__}: {exc}")
+            self._set_log(f"⚠ Could not pause: {type(exc).__name__}: {exc}")
             return
         self.lbl_badge.setText("PAUSED")
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_AMBER, SOLORA_BG))
-        self.lbl_log.setText("Transfer paused. Byte offset preserved.")
+        self._set_log("Transfer paused. Byte offset preserved.")
         self.btn_pause.setEnabled(False)
         self.btn_start.setText("▶  RESUME")
         self.btn_start.setEnabled(True)
@@ -2004,7 +2024,7 @@ class SenderScreen(QWidget):
         self.lbl_badge.setText("CANCELLED")
         # Item 8: SOLORA_BG on ALERT_RED is 5.99:1; plain white was 3.27:1.
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ALERT_RED, SOLORA_BG))
-        self.lbl_log.setText("Transfer cancelled by user. Progress discarded.")
+        self._set_log("Transfer cancelled by user. Progress discarded.")
         self.btn_pause.setEnabled(False)
         self.btn_start.setText("▶  START TRANSFER")
         self.btn_start.setEnabled(True)
@@ -2014,7 +2034,7 @@ class SenderScreen(QWidget):
         """Worker confirmed a deliberate pause (not a failure)."""
         self.lbl_badge.setText("PAUSED")
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_AMBER, SOLORA_BG))
-        self.lbl_log.setText("Transfer paused. Byte offset preserved.")
+        self._set_log("Transfer paused. Byte offset preserved.")
         self.btn_pause.setEnabled(False)
         self.btn_start.setText("▶  RESUME")
         self.btn_start.setEnabled(True)
@@ -2038,14 +2058,14 @@ class SenderScreen(QWidget):
     def on_status(self, badge, msg):
         self.lbl_badge.setText(badge.upper())
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_CYAN, SOLORA_BG))
-        self.lbl_log.setText(msg)
+        self._set_log(msg)
         self.lbl_log.setToolTip(msg)
 
     def on_completed(self, res):
         self.lbl_badge.setText("COMPLETED")
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ENERGY_GREEN, SOLORA_BG))
         sha = (res or {}).get("calculated_sha256", "")
-        self.lbl_log.setText(f"✓ Transfer Complete! SHA-256: {sha[:16]}...")
+        self._set_log(f"✓ Transfer Complete! SHA-256: {sha[:16]}...")
         self.lbl_log.setToolTip(f"SHA-256: {sha}")
         self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
         self.btn_start.setEnabled(True); self.btn_start.setText("▶  START TRANSFER"); self.btn_pick.setEnabled(True)
@@ -2071,7 +2091,7 @@ class SenderScreen(QWidget):
         # Item 8: SOLORA_BG on ALERT_RED = 5.99:1 (was 'white' at 3.27:1).
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_ALERT_RED, SOLORA_BG))
         msg = f"⚠ Interrupted: {err}. Progress saved — tap Resume when ready."
-        self.lbl_log.setText(msg)
+        self._set_log(msg)
         self.lbl_log.setToolTip(msg)
         # Item 3: cancel must not stay clickable after a failure.
         self.btn_pause.setEnabled(False); self.btn_cancel.setEnabled(False)
@@ -2088,7 +2108,7 @@ class SenderScreen(QWidget):
         self.lbl_file.setToolTip(entry.get("file_path") or entry.get("filename", ""))
         self.lbl_badge.setText("RESUMING")
         self.lbl_badge.setStyleSheet(badge_qss(SOLORA_AMBER, SOLORA_BG))
-        self.lbl_log.setText(f"Resuming session {self.active_transfer_id}...")
+        self._set_log(f"Resuming session {self.active_transfer_id}...")
         path, _ = QFileDialog.getOpenFileName(self, f"Re-select: {entry.get('filename','')}", os.path.expanduser("~"))
         if path:
             self.selected_file = path

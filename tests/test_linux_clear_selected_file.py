@@ -118,3 +118,28 @@ def test_escape_prefers_cancelling_a_running_transfer(sender, monkeypatch):
 
     assert cancelled == [True], "Esc cleared the card instead of cancelling"
     screen.active_worker = None
+
+
+def test_no_redundant_banner_when_a_file_is_chosen(sender):
+    """Selecting a file must not restate the name and size the card already shows."""
+    screen, payload = sender
+    screen.set_file(payload)
+    assert screen.lbl_log.text() == "", \
+        f"banner still says {screen.lbl_log.text()!r}"
+    assert screen.log_box.isVisibleTo(screen) is False, \
+        "empty banner is still on screen"
+
+
+def test_real_events_still_show_the_banner(sender):
+    """Suppressing chatter must not silence the messages that matter."""
+    screen, _ = sender
+    screen._set_log("Connecting to peer...")
+    assert screen.log_box.isVisibleTo(screen) is True
+    assert screen.lbl_log.text() == "Connecting to peer..."
+
+
+def test_banner_is_hidden_again_when_cleared(sender):
+    screen, payload = sender
+    screen._set_log("Something happened")
+    screen.set_file(payload)
+    assert screen.log_box.isVisibleTo(screen) is False
