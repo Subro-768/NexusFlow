@@ -16,6 +16,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 from auth_token import TOKEN_HEADER, generate_token, token_from_request, tokens_match
+from safe_filename import safe_filename
 
 try:
     from storage import record_received_entry
@@ -392,7 +393,10 @@ class EmbeddedReceiverServer:
                         body = self.rfile.read(length)
                         data = json.loads(body.decode())
                         
-                        filename = data.get("filename", "unknown_file")
+                        # Untrusted: chosen by the sender, so reduced to a safe
+                        # single path segment before it is joined to anything.
+                        filename = safe_filename(data.get("filename", ""),
+                                                 fallback="unknown_file")
                         filesize = data.get("filesize") or data.get("total_size", 0)
                         checksum = data.get("checksum") or data.get("sha256")
                         
