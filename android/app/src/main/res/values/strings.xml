@@ -194,4 +194,5 @@
     <string name="cancel">Cancel</string>
     <string name="status_no_device">NO DEVICE</string>
     <string name="msg_no_device">No device answered at %1$s:%2$s. Turn on Enable Receiving on the other device, then press Resume.</string>
+    <string name="receiver_pairing_token">Pairing code</string>
 </resources>

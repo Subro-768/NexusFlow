@@ -59,6 +59,18 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
     private val threadPool = Executors.newCachedThreadPool()
     private var isRunning = false
 
+    /**
+     * Pairing token for this receiver: shown on the Hub screen and carried in
+     * the QR, so a sender can prove it is meant for this device rather than
+     * merely able to reach it.
+     *
+     * Regenerated on every [start], so a token captured from an earlier session
+     * stops working rather than lingering as a standing key.
+     */
+    @Volatile
+    var authToken: String = PairingToken.generate()
+        private set
+
     // State
     private val _incomingState = MutableStateFlow<IncomingTransferState?>(null)
     val incomingState: StateFlow<IncomingTransferState?> = _incomingState.asStateFlow()
@@ -89,6 +101,9 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
     fun start(): Boolean {
         if (isRunning) return true
         return try {
+            // Fresh credential per session: a code read off a screenshot of an
+            // earlier session must not keep working.
+            authToken = PairingToken.generate()
             serverSocket = ServerSocket(port, 50, InetAddress.getByName("0.0.0.0"))
             isRunning = true
             activeInstance = this
@@ -161,6 +176,27 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             if (method == "OPTIONS") {
                 sendCorsOk(output)
                 return
+            }
+
+            // /health and the landing page stay outside the gate: the sender's
+            // pre-flight probe needs /health to learn there is anything here
+            // worth authenticating with, and neither exposes anything usable.
+            // Everything that reads or writes a file needs the token.
+            if (!isOpenPath(path)) {
+                val query = fullPath.substringAfter("?", "")
+                if (!PairingToken.matches(authToken, PairingToken.from(headers, query))) {
+                    // Drain the body before answering. The client is usually
+                    // still writing it, and closing on an unread request makes
+                    // the kernel send RST -- which the sender sees as a dead
+                    // connection instead of the 401 and the reason for it. A
+                    // rejection a caller cannot read is not a rejection.
+                    drainRequestBody(input, headers)
+                    sendJson(
+                        output, 401,
+                        """{"error":"unauthorised","detail":"Pairing token missing or wrong. Scan the QR on this device, or type the code shown in its endpoint panel."}"""
+                    )
+                    return
+                }
             }
 
             when {
@@ -709,6 +745,39 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
         output.write(headers.toByteArray(Charsets.UTF_8))
         output.flush()
     }
+
+    /**
+     * Paths reachable without a token.
+     *
+     * Deliberately short. `/health` is what tells a sender there is something
+     * here worth authenticating against, and it returns a status and a device
+     * name — never the token. Everything that touches a file is authenticated.
+     */
+    /**
+     * Read and discard a request body we are about to refuse.
+     *
+     * Bounded by Content-Length, and tolerant of a client that sends less than
+     * it promised -- this runs on the rejection path, so it must never be the
+     * thing that throws. A socket error here still gets the 401 out.
+     */
+    private fun drainRequestBody(input: InputStream, headers: Map<String, String>) {
+        val length = headers["content-length"]?.toIntOrNull() ?: 0
+        if (length <= 0) return
+        var remaining = length
+        try {
+            val scratch = ByteArray(8192)
+            while (remaining > 0) {
+                val read = input.read(scratch, 0, minOf(scratch.size, remaining))
+                if (read <= 0) break
+                remaining -= read
+            }
+        } catch (e: Exception) {
+            Log.d(tag, "drain before 401 ended early: ${e.message}")
+        }
+    }
+
+    private fun isOpenPath(path: String): Boolean =
+        path == "/" || path == "/index.html" || path == "/health" || path == "/favicon.ico"
 
     private fun sendJson(output: OutputStream, statusCode: Int, json: Any) {
         val body = json.toString().toByteArray(Charsets.UTF_8)

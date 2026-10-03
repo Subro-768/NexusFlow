@@ -10,7 +10,16 @@ import java.util.concurrent.TimeUnit
 
 class TransferApiClient(
     private val serverUrl: String,
-    connectTimeoutSeconds: Long = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    connectTimeoutSeconds: Long = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    /**
+     * The receiver's pairing token, or "" when none is known.
+     *
+     * With the receiver gated, a missing token is a 401 on the very first call,
+     * so this is attached centrally rather than left to each call site to
+     * remember — a per-chunk post that forgot it would fail mid-transfer and
+     * surface as an unexplained connection error.
+     */
+    private val token: String = ""
 ) {
 
     companion object {
@@ -33,6 +42,17 @@ class TransferApiClient(
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .apply {
+            if (token.isNotBlank()) {
+                addInterceptor { chain ->
+                    chain.proceed(
+                        chain.request().newBuilder()
+                            .header(com.resumabletransfer.app.server.PairingToken.HEADER, token)
+                            .build()
+                    )
+                }
+            }
+        }
         .build()
 
     fun cancelAllRequests() {

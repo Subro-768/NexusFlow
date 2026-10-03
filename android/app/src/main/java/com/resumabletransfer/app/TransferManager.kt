@@ -48,6 +48,7 @@ class TransferManager private constructor(private val context: Context) {
         private const val KEY_STATUS = "transfer_status"
         private const val KEY_TRANSFERRED = "transfer_transferred_bytes"
         private const val KEY_PEER_NAME = "transfer_peer_name"
+    const val KEY_PEER_TOKEN_PREFIX = "peer_token_"
 
         /** Persisting every chunk would hammer the disk; once a second is plenty. */
         private const val PERSIST_INTERVAL_MS = 1000L
@@ -388,7 +389,16 @@ class TransferManager private constructor(private val context: Context) {
         filename: String,
         fileSize: Long,
         existingTransferId: String? = null,
-        peerDisplayName: String = ""
+        peerDisplayName: String = "",
+        /**
+         * Receiver's pairing token, or "" if none is known.
+         *
+         * Empty is not an error here — the request will be refused with 401 and
+         * the UI says so in those words — because the common case (a token read
+         * from a QR) arrives separately from this call and must not block the
+         * optimistic UI.
+         */
+        token: String = ""
     ) {
         val chunkSize = getChunkSizeKb() * 1024
         val throttleDelay = getThrottleDelayMs()
@@ -412,7 +422,7 @@ class TransferManager private constructor(private val context: Context) {
         activeSpec = ActiveSpec(serverUrl, uri, filename, fileSize, peerDisplayName)
 
         transferJob = coroutineScope.launch {
-            val client = TransferApiClient(serverUrl)
+            val client = TransferApiClient(serverUrl, token = token)
             activeApiClient = client
 
             try {
@@ -912,13 +922,30 @@ class TransferManager private constructor(private val context: Context) {
         uri: Uri,
         filename: String,
         fileSize: Long,
-        peerDisplayName: String = ""
+        peerDisplayName: String = "",
+        token: String = ""
     ) {
         val currentTransferId = _progressState.value.transferId.ifEmpty {
             prefs.getString(KEY_TRANSFER_ID, null)
         }
-        startTransfer(serverUrl, uri, filename, fileSize, currentTransferId, peerDisplayName)
+        startTransfer(serverUrl, uri, filename, fileSize, currentTransferId, peerDisplayName, token)
     }
+
+    /**
+     * Remember a receiver's token against its host.
+     *
+     * Held in prefs rather than memory because a resumed transfer is the case
+     * that matters: the process may have died since the QR was scanned, and
+     * re-scanning to retry would be absurd.
+     */
+    fun rememberPeerToken(host: String, token: String) {
+        val clean = host.trim()
+        if (clean.isEmpty() || token.isBlank()) return
+        prefs.edit().putString(KEY_PEER_TOKEN_PREFIX + clean, token.trim()).apply()
+    }
+
+    fun tokenForHost(host: String): String =
+        prefs.getString(KEY_PEER_TOKEN_PREFIX + host.trim(), "").orEmpty()
 
     fun cancelTransfer() {
         isCancelled = true

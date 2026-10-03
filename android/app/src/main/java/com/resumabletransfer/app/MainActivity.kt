@@ -74,8 +74,24 @@ private const val PAIRING_LOOKUP_MS = 12_000L
  * photographed, screenshotted and sent over chat, and none of those should leak
  * a LAN address. The sender resolves the name over mDNS.
  */
-fun buildPairingPayload(deviceName: String): String =
-    RECEIVE_SCHEME + java.net.URLEncoder.encode(deviceName.ifBlank { "NexusFlow" }, "UTF-8")
+fun buildPairingPayload(deviceName: String, token: String = ""): String {
+    val name = java.net.URLEncoder.encode(deviceName.ifBlank { "NexusFlow" }, "UTF-8")
+    val code = RECEIVE_SCHEME + name
+    // The token rides along as ?t=. Hiding the address and carrying the
+    // credential are independent decisions and both have to hold: a scan that
+    // yielded an address but no token would leave the sender authenticated to
+    // nothing, and every request would come back 401.
+    return if (token.isBlank()) code else "$code?t=$token"
+}
+
+/** Read `?t=` back out of a pairing payload, tolerating its absence. */
+fun pairingTokenOf(payload: String): String? =
+    payload.substringAfter('?', "")
+        .split("&")
+        .firstOrNull { it.startsWith("t=") }
+        ?.substringAfter("t=")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
 private const val DEFAULT_PORT = 8000
 
 private const val STATE_URI = "state_selected_uri"
@@ -145,6 +161,15 @@ class MainActivity : ComponentActivity() {
     /** Drives the themed pairing dialog from setContent rather than from a View. */
     private var pairingDialogVisible by mutableStateOf(false)
 
+    /**
+     * Token from the most recently scanned code, not yet tied to a host.
+     *
+     * Held between parsing the code and resolving its name to an address,
+     * because in the `nexus://receive/<name>` form the address is not known
+     * until discovery answers.
+     */
+    private var pendingPairToken: String? = null
+
     private fun notifyUser(message: String) {
         lifecycleScope.launch {
             snackbarHostState.currentSnackbarData?.dismiss()
@@ -192,6 +217,15 @@ class MainActivity : ComponentActivity() {
         val uri = raw.trim()
         val host: String?
         val port: Int?
+
+        // The receiver's pairing code carries its token as ?t=. Read it here,
+        // before the form is interpreted, so every accepted form is
+        // authenticated -- a code that resolved an address but not a token would
+        // leave the sender unable to do anything with it.
+        val scannedToken = pairingTokenFrom(uri)
+        if (!scannedToken.isNullOrBlank()) {
+            pendingPairToken = scannedToken
+        }
         when {
             // `nexus://receive/<name>` is what the Linux Hub draws and now what
             // this app draws too. It carries no address on purpose: a photo of the
@@ -268,8 +302,27 @@ class MainActivity : ComponentActivity() {
         if (port != null) serverPort = port.toString()
         transferManager.setSavedServerIp(serverIp)
         transferManager.setSavedServerPort(serverPort)
+        pendingPairToken?.let { transferManager.rememberPeerToken(serverIp, it) }
         notifyUser(getString(R.string.msg_pairing_connected, serverIp, serverPort))
         testConnection()
+    }
+
+    /**
+     * Pull `?t=` out of a pairing payload, tolerating any form this app accepts.
+     *
+     * Kept separate from the host/port parsing because the token is optional in
+     * every one of those forms: a code written by hand may simply not have one,
+     * and a missing token must not stop the address from being used -- the
+     * receiver will refuse with a 401 and the UI says so.
+     */
+    private fun pairingTokenFrom(uri: String): String? {
+        val query = uri.substringAfter('?', "")
+        if (query.isEmpty()) return null
+        return query.split("&")
+            .firstOrNull { it.startsWith("t=") }
+            ?.substringAfter("t=")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
     }
 
     /**
@@ -698,11 +751,16 @@ class MainActivity : ComponentActivity() {
                                     port = DEFAULT_PORT,
                                     pairingPayload = if (isReceiverRunning) {
                                         buildPairingPayload(
-                                            deviceName.ifBlank { transferManager.getDeviceName() }
+                                            deviceName.ifBlank { transferManager.getDeviceName() },
+                                            // Read live from the server: a token
+                                            // captured when this composable was
+                                            // built would be stale after a restart.
+                                            token = embeddedServer?.authToken.orEmpty()
                                         )
                                     } else {
                                         null
                                     },
+                                    pairingToken = embeddedServer?.authToken.orEmpty(),
                                     onCancelIncoming = {
                                         val id = incomingTransfer?.transferId
                                         if (id != null && embeddedServer?.cancelIncoming(id) == true) {
@@ -823,7 +881,8 @@ class MainActivity : ComponentActivity() {
             uri = uri,
             filename = entry.filename,
             fileSize = entry.totalBytes,
-            peerDisplayName = entry.peerName.ifBlank { selectedPeerName }
+            peerDisplayName = entry.peerName.ifBlank { selectedPeerName },
+            token = transferManager.tokenForHost(serverIp.trim())
         )
     }
 
@@ -913,7 +972,8 @@ class MainActivity : ComponentActivity() {
             uri = uri,
             filename = name,
             fileSize = size,
-            peerDisplayName = selectedPeerName
+            peerDisplayName = selectedPeerName,
+            token = transferManager.tokenForHost(serverIp.trim())
         )
     }
 

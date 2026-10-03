@@ -150,4 +150,5 @@
     <string name="cancel">Abbrechen</string>
     <string name="status_no_device">KEIN GERÄT</string>
     <string name="msg_no_device">Kein Gerät unter %1$s:%2$s erreichbar. Aktiviere auf dem anderen Gerät „Empfangen“ und drücke dann Fortsetzen.</string>
+    <string name="receiver_pairing_token">Kopplungs-Code</string>
 </resources>

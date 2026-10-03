@@ -65,6 +65,14 @@ fun ReceiverScreen(
     onCancelIncoming: () -> Unit = {},
     /** `nexus://host:port` for this device, or null when it is not reachable. */
     pairingPayload: String? = null,
+    /**
+     * This receiver's pairing token, shown beside the QR so it can be typed
+     * when the camera is unusable.
+     *
+     * Kept as its own parameter rather than parsed out of [pairingPayload] so
+     * the screen does not have to know how the payload is encoded.
+     */
+    pairingToken: String = "",
     /** Live supplier for the dropdown: called when it is opened, not cached. */
     localAddresses: () -> List<String> = { emptyList() },
     port: Int = 8000
@@ -711,6 +719,37 @@ fun ReceiverScreen(
                                 style = MaterialTheme.typography.labelMedium,
                                 color = SoloraNeonLime
                             )
+                        }
+
+                        if (pairingToken.isNotBlank()) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = SoloraSurfaceElevated,
+                                border = BorderStroke(1.dp, SoloraBorder),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Text(
+                                        stringResource(R.string.receiver_pairing_token),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = SoloraTextSecondary
+                                    )
+                                    Text(
+                                        // Grouped so it can be read aloud without
+                                        // ambiguity; the alphabet already excludes
+                                        // the glyph pairs that sound alike.
+                                        pairingToken.chunked(4).joinToString(" "),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Black,
+                                        color = SoloraNeonLime,
+                                        letterSpacing = 3.sp
+                                    )
+                                }
+                            }
                         }
 
                         val qrBitmap = remember(pairingPayload) { buildQrBitmap(pairingPayload) }
