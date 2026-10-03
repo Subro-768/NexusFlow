@@ -1,4 +1,5 @@
 import os
+import sys
 import io
 import json
 import time
@@ -9,6 +10,12 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Optional, Callable
+from urllib.parse import parse_qsl
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from auth_token import TOKEN_HEADER, generate_token, token_from_request, tokens_match
 
 try:
     from storage import record_received_entry
@@ -81,6 +88,11 @@ class EmbeddedReceiverServer:
         self.thread: Optional[threading.Thread] = None
         self.is_running = False
         self.device_name: str = "NexusFlow Device"
+
+        # Pairing token for this receiver, shown on screen and carried in the QR
+        # so a sender can prove it is meant for this device and not merely able
+        # to reach it. Regenerated per start: a stale one should not linger.
+        self.auth_token: str = generate_token()
         
         # In-memory transfer records
         self._transfers_lock = threading.Lock()
@@ -201,12 +213,44 @@ class EmbeddedReceiverServer:
                     self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                     self.send_header("Access-Control-Allow-Headers", "*")
 
+                def _authorised(self, query: str) -> bool:
+                    """Whether this request may touch transfer data.
+
+                    /health and the landing page stay open on purpose: the
+                    pre-flight reachability probe and the browser page both need
+                    them, and neither exposes anything a stranger could use.
+                    Everything that reads or writes a file needs the token.
+                    """
+                    bare = query.split('?')[0]
+                    if bare in ("/", "/index.html", "/health", "/favicon.ico"):
+                        return True
+                    supplied = token_from_request(
+                        self.headers,
+                        dict(parse_qsl(query.split('?', 1)[1])) if '?' in query else None,
+                    )
+                    if tokens_match(parent.auth_token, supplied):
+                        return True
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self._send_cors()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": "unauthorised",
+                        "detail": "Pairing token missing or wrong. Scan the QR on "
+                                  "this device, or type the code shown in its "
+                                  "endpoint panel."
+                    }).encode())
+                    return False
+
                 def do_OPTIONS(self):
                     self.send_response(200)
                     self._send_cors()
                     self.end_headers()
 
                 def do_GET(self):
+                    if not self._authorised(self.path):
+                        self._drain(int(self.headers.get("Content-Length") or 0))
+                        return
                     path = self.path.split('?')[0]
 
                     # Browser friendly landing page
@@ -337,6 +381,9 @@ class EmbeddedReceiverServer:
                     self.end_headers()
 
                 def do_POST(self):
+                    if not self._authorised(self.path):
+                        self._drain(int(self.headers.get("Content-Length") or 0))
+                        return
                     path = self.path.split('?')[0]
                     
                     if path == "/transfer":

@@ -94,7 +94,7 @@ def _throttle(client, seconds=0.15):
 def test_pause_resume_cancel_from_the_hub_buttons(qapp, hub, payload):
     screen, server = hub
     base = f"http://127.0.0.1:{PORT}"
-    client = _throttle(LinuxTransferClient(base, chunk_size=CHUNK))
+    client = _throttle(LinuxTransferClient(base, chunk_size=CHUNK, token=server.auth_token))
     digest = LinuxTransferClient.calculate_sha256(payload)
     tid = client.create_transfer(payload, checksum=digest, chunk_size=CHUNK)["transfer_id"]
 
@@ -175,7 +175,7 @@ def test_pause_resume_cancel_from_the_hub_buttons(qapp, hub, payload):
 def test_cancel_button_deletes_the_partial(qapp, hub, payload):
     screen, server = hub
     base = f"http://127.0.0.1:{PORT}"
-    client = LinuxTransferClient(base, chunk_size=CHUNK)
+    client = LinuxTransferClient(base, chunk_size=CHUNK, token=server.auth_token)
     tid = client.create_transfer(payload, chunk_size=CHUNK)["transfer_id"]
 
     partial = os.path.join(str(server.upload_dir), os.path.basename(payload))

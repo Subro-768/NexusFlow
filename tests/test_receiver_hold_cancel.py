@@ -63,7 +63,7 @@ def _start_session(client, payload):
 def test_receiver_pause_holds_then_resume_completes(receiver, payload):
     """The pause must stop bytes, and resuming must finish the same file."""
     base = f"http://127.0.0.1:{PORT}"
-    client = LinuxTransferClient(base, chunk_size=CHUNK)
+    client = LinuxTransferClient(base, chunk_size=CHUNK, token=receiver.auth_token)
     transfer_id, digest = _start_session(client, payload)
 
     offset_seen = {}
@@ -104,6 +104,7 @@ def test_receiver_pause_holds_then_resume_completes(receiver, payload):
         data=b"z" * 16,
         headers={
             "X-Start-Byte": "0",
+            "X-NexusFlow-Token": receiver.auth_token,
             "X-End-Byte": "15",
             "X-Total-Size": str(os.path.getsize(payload)),
         },
@@ -129,7 +130,7 @@ def test_receiver_pause_holds_then_resume_completes(receiver, payload):
 
 def test_receiver_cancel_ends_session_and_deletes_partial(receiver, payload):
     base = f"http://127.0.0.1:{PORT}"
-    client = LinuxTransferClient(base, chunk_size=CHUNK)
+    client = LinuxTransferClient(base, chunk_size=CHUNK, token=receiver.auth_token)
     transfer_id, _ = _start_session(client, payload)
 
     partial = os.path.join(str(receiver.upload_dir), os.path.basename(payload))
@@ -147,6 +148,7 @@ def test_receiver_cancel_ends_session_and_deletes_partial(receiver, payload):
         data=b"z" * 16,
         headers={
             "X-Start-Byte": "0",
+            "X-NexusFlow-Token": receiver.auth_token,
             "X-End-Byte": "15",
             "X-Total-Size": str(os.path.getsize(payload)),
         },
@@ -159,15 +161,15 @@ def test_receiver_cancel_ends_session_and_deletes_partial(receiver, payload):
 def test_control_endpoints_over_http(receiver, payload):
     """The same operations, reachable without touching the Hub UI."""
     base = f"http://127.0.0.1:{PORT}"
-    client = LinuxTransferClient(base, chunk_size=CHUNK)
+    client = LinuxTransferClient(base, chunk_size=CHUNK, token=receiver.auth_token)
     transfer_id, _ = _start_session(client, payload)
 
-    assert requests.post(f"{base}/transfer/{transfer_id}/pause", timeout=10).json()["ok"]
+    assert requests.post(f"{base}/transfer/{transfer_id}/pause", headers={"X-NexusFlow-Token": receiver.auth_token}, timeout=10).json()["ok"]
     assert receiver.transfers[transfer_id]["status"] == "paused"
-    assert requests.post(f"{base}/transfer/{transfer_id}/resume", timeout=10).json()["ok"]
+    assert requests.post(f"{base}/transfer/{transfer_id}/resume", headers={"X-NexusFlow-Token": receiver.auth_token}, timeout=10).json()["ok"]
     assert receiver.transfers[transfer_id]["status"] == "in_progress"
-    assert requests.post(f"{base}/transfer/{transfer_id}/cancel", timeout=10).json()["ok"]
+    assert requests.post(f"{base}/transfer/{transfer_id}/cancel", headers={"X-NexusFlow-Token": receiver.auth_token}, timeout=10).json()["ok"]
 
-    missing = requests.post(f"{base}/transfer/does-not-exist/pause", timeout=10)
+    missing = requests.post(f"{base}/transfer/does-not-exist/pause", headers={"X-NexusFlow-Token": receiver.auth_token}, timeout=10)
     assert missing.status_code == 404
     assert missing.json()["ok"] is False

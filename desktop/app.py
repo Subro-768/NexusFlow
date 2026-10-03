@@ -458,15 +458,37 @@ def save_settings(cfg: Settings) -> Settings:
     return SETTINGS
 
 
-def make_client(base_url: str) -> LinuxTransferClient:
-    """Build a client that honours the persisted chunk size / timeout / verify."""
+def make_client(base_url: str, token: str = "") -> LinuxTransferClient:
+    """Build a client that honours the persisted chunk size / timeout / verify.
+
+    ``token`` is the receiver's pairing token. Without it every data request is
+    refused with 401, which is the point: reachability is not consent. It
+    normally arrives with the address, from a scanned QR or a typed pairing code,
+    and is cached per host so a resumed transfer keeps working.
+    """
     cfg = SETTINGS if isinstance(SETTINGS, Settings) else Settings()
+    if not token:
+        token = peer_tokens.get(_host_of(base_url), "")
     return LinuxTransferClient(
         base_url,
         timeout=cfg.timeout_sec,
         chunk_size=cfg.chunk_size,
         verify_checksum=cfg.verify_checksum,
+        token=token,
     )
+
+
+#: pairing token per host, learned from a QR scan or a typed code
+peer_tokens: Dict[str, str] = {}
+
+
+def _host_of(base_url: str) -> str:
+    """Bare host from a URL, tolerating one with or without a scheme or port."""
+    raw = (base_url or "").strip()
+    for prefix in ("http://", "https://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+    return raw.split("/", 1)[0].split(":", 1)[0].strip()
 
 
 # ─── nexus:// pairing scheme (encoded in the receiver QR, parsed on the sender) ─
@@ -477,13 +499,17 @@ class PairTarget:
     port: int = 8000
     name: str = ""
     raw: str = ""
+    #: Pairing token carried in the code. The receiver's own QR deliberately
+    #: omits the address but MUST carry this, otherwise a scan yields an
+    #: authenticated channel to nothing.
+    token: str = ""
 
     @property
     def is_valid(self) -> bool:
         return bool(self.host)
 
 
-def build_pairing_name(name: str) -> str:
+def build_pairing_name(name: str, token: str = "") -> str:
     """``nexus://receive/<name>`` — a pairing code that carries no address.
 
     The receiver QR used to encode the host and port alongside the name, so a
@@ -496,7 +522,7 @@ def build_pairing_name(name: str) -> str:
     return f"{NEXUS_SCHEME}://receive/{quote(name or '', safe='')}"
 
 
-def build_pairing_url(host: str, port: int, name: str = "") -> str:
+def build_pairing_url(host: str, port: int, name: str = "", token: str = "") -> str:
     """``nexus://receive/<name>?host=<ip>&port=<n>``.
 
     Still used when a host is explicitly known (e.g. importing another device's
@@ -510,6 +536,8 @@ def build_pairing_url(host: str, port: int, name: str = "") -> str:
         params.append(f"host={quote(host, safe='')}")
     if port:
         params.append(f"port={int(port)}")
+    if token:
+        params.append(f"t={quote(token, safe='')}")
     if params:
         url += "?" + "&".join(params)
     return url
@@ -545,7 +573,8 @@ def parse_pairing_url(text: str) -> PairTarget:
         port = 8000
         if port_raw.isdigit():
             port = int(port_raw)
-        return PairTarget(host=host, port=port, name=name, raw=text)
+        return PairTarget(host=host, port=port, name=name, raw=text,
+                          token=(qs.get("t") or [""])[0].strip())
     if text.lower().startswith(("http://", "https://")):
         try:
             parsed = urlparse(text)
@@ -553,13 +582,18 @@ def parse_pairing_url(text: str) -> PairTarget:
             return PairTarget(raw=text)
         port = parsed.port or (443 if parsed.scheme == "https" else 8000)
         return PairTarget(host=(parsed.hostname or ""), port=port, name="", raw=text)
-    # Bare host or host:port
-    if _looks_like_host(text):
-        host, _, port_raw = text.rpartition(":")
+    # Bare host or host:port, optionally with ?t=<token>
+    if _looks_like_host(text.split("?", 1)[0]):
+        from urllib.parse import parse_qs
+        base, _, query = text.partition("?")
+        host, _, port_raw = base.rpartition(":")
         if not host:
-            host, port_raw = text, ""
+            host, port_raw = base, ""
         port = int(port_raw) if port_raw.isdigit() else 8000
-        return PairTarget(host=host, port=port, name="", raw=text)
+        token = ""
+        if query:
+            token = (parse_qs(query).get("t") or [""])[0].strip()
+        return PairTarget(host=host, port=port, name="", raw=text, token=token)
     return PairTarget(raw=text)
 
 
@@ -2322,6 +2356,12 @@ class ReceiverScreen(QWidget):
         cl.addWidget(self.lbl_device_identity)
 
         qr_row = QHBoxLayout()
+        self.lbl_token = QLabel()
+        self.lbl_token.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 12px;")
+        self.lbl_token.setAccessibleName("Pairing code")
+        self.lbl_token.setAccessibleDescription(
+            "Type this on the sending device if you cannot scan the QR code.")
+        self._refresh_token_label()
         self.lbl_qr = QLabel()
         self.lbl_qr.setStyleSheet("background: white; padding: 6px; border-radius: 8px;")
         self.lbl_qr.setFixedSize(160,160)
@@ -2329,9 +2369,10 @@ class ReceiverScreen(QWidget):
         self.lbl_qr.setAccessibleName("Pairing QR code")
         self.lbl_qr.setAccessibleDescription(
             "Scan or copy this code on the sender device to prefill host and port.")
-        # The QR encodes the device NAME, not an address, so scanning it does
-        # not disclose this machine's IP to a camera.
-        self.update_qr(build_pairing_name(self._device_name))
+        # The QR encodes the device NAME plus the pairing token, not an address,
+        # so scanning it neither discloses this machine's IP nor leaves the
+        # sender authenticated to nothing.
+        self.update_qr(self._pairing_code())
         qr_row.addWidget(self.lbl_qr)
 
         qr_row.addSpacing(16)
@@ -2528,7 +2569,7 @@ class ReceiverScreen(QWidget):
         self.lbl_step2.setText(
             f"2. Tap your device name <b>{self._device_name}</b> on the sender device (auto-discovered)."
         )
-        self.update_qr(build_pairing_name(self._device_name))
+        self.update_qr(self._pairing_code())
         self.ip_updated_signal.emit(self.current_ip)
 
     def refresh_received_files(self):
@@ -2662,6 +2703,24 @@ class ReceiverScreen(QWidget):
         # already hides itself for a path that no longer exists.
         self.refresh_received_files()
         self.lbl_payload_info.setText(f"Deleted “{name}” from this computer.")
+
+    def _pairing_code(self) -> str:
+        """The QR payload for this receiver: its name and its live token.
+
+        Recomputed on every refresh rather than captured once, so a receiver
+        restarted between the screen being built and being used cannot hand out
+        a token that no longer matches.
+        """
+        token = self._receiver.auth_token if getattr(self, "_receiver", None) else ""
+        return build_pairing_name(self._device_name, token=token)
+
+    def _refresh_token_label(self) -> None:
+        """Show the token so it can be typed instead of scanned."""
+        token = self._receiver.auth_token if getattr(self, "_receiver", None) else "--"
+        self.lbl_token.setText(
+            f"<b style='color:{SOLORA_AMBER};'>Pairing code:</b> "
+            f"<b style='color:{SOLORA_AMBER};'>{token}</b>"
+        )
 
     def update_qr(self, text):
         try:

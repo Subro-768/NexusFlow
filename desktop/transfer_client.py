@@ -22,7 +22,13 @@ import threading
 import time
 from typing import Callable, Optional
 
+import os
+import sys
+
 import requests
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from auth_token import TOKEN_HEADER
 
 DEFAULT_CHUNK_SIZE = 1024 * 1024
 DEFAULT_TIMEOUT = 30.0
@@ -50,9 +56,16 @@ class LinuxTransferClient:
         timeout: float = DEFAULT_TIMEOUT,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         verify_checksum: bool = True,
+        token: str = "",
     ):
         self.base_url = base_url.rstrip('/')
         self.session = requests.Session()
+        self.token = (token or "").strip()
+        if self.token:
+            # Set once on the session so every request carries it, including the
+            # per-chunk posts: a chunk that arrived without it would be rejected
+            # mid-transfer and surface as a confusing connection error.
+            self.session.headers.update({TOKEN_HEADER: self.token})
         self.timeout = float(timeout or DEFAULT_TIMEOUT)
         self.chunk_size = int(chunk_size or DEFAULT_CHUNK_SIZE)
         self.verify_checksum = bool(verify_checksum)
