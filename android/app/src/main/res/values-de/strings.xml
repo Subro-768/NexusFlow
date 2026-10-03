@@ -81,7 +81,7 @@
     <string name="msg_pairing_unrecognised">Dieser Kopplungscode konnte nicht gelesen werden</string>
     <string name="msg_pairing_connected">Ziel gesetzt auf %1$s:%2$s</string>
     <string name="msg_qr_scanned">Kopplungscode</string>
-    <string name="pairing_dialog_message">Kopplungscode des empfangenden Geräts einfügen oder eingeben (nexus://host:port).</string>
+    <string name="pairing_dialog_message">Gib den Code des empfangenden Geräts ein, wenn du die Kamera nicht nutzen kannst.</string>
 
     <string name="history_empty">Noch keine Übertragungen aufgezeichnet</string>
     <string name="history_resume">FORTSETZEN</string>
@@ -144,4 +144,8 @@
     <string name="receiver_no_address">Noch keine Netzwerkadresse — mit WLAN verbinden.</string>
     <string name="receiver_endpoint_hint">Geräte finden dich normalerweise beim Namen; die Adresse wird nur gebraucht, wenn die Suche scheitert.</string>
     <string name="msg_pairing_searching">Suche nach \'%1$s\' im Netzwerk\u2026</string>
+    <string name="pairing_dialog_title">Kopplungs-Code</string>
+    <string name="pairing_dialog_connect">VERBINDEN</string>
+    <string name="pairing_dialog_bad_code">Das sieht nicht nach einem Kopplungs-Code aus.</string>
+    <string name="cancel">Abbrechen</string>
 </resources>

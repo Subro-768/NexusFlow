@@ -115,7 +115,7 @@
     <string name="msg_pairing_unrecognised">Could not read that pairing code</string>
     <string name="msg_pairing_connected">Target set to %1$s:%2$s</string>
     <string name="msg_qr_scanned">Pairing code</string>
-    <string name="pairing_dialog_message">Paste or type the pairing code shown by the receiving device (nexus://host:port).</string>
+    <string name="pairing_dialog_message">Type the code shown by the receiving device, if you cannot use the camera.</string>
 
     <!-- Content descriptions: receiver/history -->
     <string name="cd_verified">Verified</string>
@@ -188,4 +188,8 @@
     <string name="receiver_no_address">No network address yet — connect to Wi-Fi.</string>
     <string name="receiver_endpoint_hint">Peers normally find you by name, so the address is only needed when discovery fails.</string>
     <string name="msg_pairing_searching">Looking for \'%1$s\' on this network\u2026</string>
+    <string name="pairing_dialog_title">Pairing code</string>
+    <string name="pairing_dialog_connect">CONNECT</string>
+    <string name="pairing_dialog_bad_code">That does not look like a pairing code.</string>
+    <string name="cancel">Cancel</string>
 </resources>

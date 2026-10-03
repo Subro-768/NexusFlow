@@ -36,6 +36,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.resumabletransfer.app.server.EmbeddedTransferServer
+import com.resumabletransfer.app.ui.PairingCodeDialog
 import com.resumabletransfer.app.ui.ReceiverScreen
 import com.resumabletransfer.app.ui.ResumableTransferTheme
 import com.resumabletransfer.app.ui.SettingsScreen
@@ -140,6 +141,9 @@ class MainActivity : ComponentActivity() {
      * from inside a composable cannot do any of that.
      */
     private val snackbarHostState = SnackbarHostState()
+
+    /** Drives the themed pairing dialog from setContent rather than from a View. */
+    private var pairingDialogVisible by mutableStateOf(false)
 
     private fun notifyUser(message: String) {
         lifecycleScope.launch {
@@ -276,20 +280,15 @@ class MainActivity : ComponentActivity() {
      * `nexus://host:port` payload -- the exact string the desktop Receiver screen
      * puts in its QR.
      */
+    /**
+     * Opens the themed pairing-code dialog.
+     *
+     * Was an `android.app.AlertDialog`, which renders in the platform theme: a
+     * white box with teal buttons in the middle of a dark screen. The dialog is
+     * composed instead, so it inherits the app palette like everything else.
+     */
     private fun showPairingCodeDialog() {
-        val input = android.widget.EditText(this).apply {
-            hint = "nexus://192.168.1.5:8000"
-            setSingleLine()
-        }
-        android.app.AlertDialog.Builder(this)
-            .setTitle(R.string.msg_qr_scanned)
-            .setMessage(R.string.pairing_dialog_message)
-            .setView(input)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                applyPairingUri(input.text.toString())
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        pairingDialogVisible = true
     }
 
     private val filePickerLauncher = registerForActivityResult(
@@ -447,6 +446,19 @@ class MainActivity : ComponentActivity() {
                             sharedQueueIndex
                         )
                     }
+                }
+
+                // Hosted here rather than as an android.app.Dialog so it is
+                // composed with the app's own theme and cannot fall back to the
+                // platform's light styling.
+                if (pairingDialogVisible) {
+                    PairingCodeDialog(
+                        onDismiss = { pairingDialogVisible = false },
+                        onSubmit = { payload ->
+                            pairingDialogVisible = false
+                            applyPairingUri(payload)
+                        }
+                    )
                 }
 
                 BackHandler(enabled = drawerState.isOpen || currentScreen != ScreenNav.TRANSFER) {
