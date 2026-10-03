@@ -28,14 +28,22 @@ cd android && ./gradlew assembleDebug
 adb install -r -d android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-A prebuilt debug APK is committed at **[`app-release/NexusFlow-debug.apk`](app-release/)**,
-so you can install without building.
+Prebuilt artifacts, so nothing has to be built to try it:
+
+| | |
+|---|---|
+| **`app-release/NexusFlow-debug.apk`** | The Android app. Debug-signed. |
+| **`app-release/NexusFlow-Linux-x86_64.tar.gz`** | The Linux client, a second endpoint of the same protocol. |
 
 > Debug-signed: `adb install -r -d app-release/NexusFlow-debug.apk`. No release
 > keystore is configured in this repository; see *Known limitations*.
 
 **Send a file:** open the app, pick a device under *Nearby Devices*, select a
 file, press **START TRANSFER**.
+
+**Pairing by QR:** the receiving device shows a pairing code in the Receiver Hub;
+the sending device taps **Scan QR** (next to *Nearby Devices*) and the camera
+decodes it. The code carries the device *name*, not an address — `nexus://receive/<name>` — because a QR gets photographed and sent over chat, and neither should hand over a LAN IP. The sender resolves the name over mDNS. A keyboard button sits beside the scan button for devices whose camera is unusable.
 
 **Receive a file:** open *Receiver Hub*, enable receiving, and send to the
 device from any other device on the same network.
@@ -232,6 +240,35 @@ nobody is reading.
   sender reliably learns the transfer was cancelled on purpose.
 - **Receiver offline mid-file** — the session survives on the receiver; the
   transfer resumes when it returns.
+
+---
+
+## The Linux client
+
+The Android app is the deliverable. The Linux client is a **second endpoint of
+the same protocol**, included so the behaviour could be tested against a real
+peer from both directions rather than only phone-to-phone.
+
+* **Receiving** — the Hub shows a pairing code, and **Pause / Resume / Cancel**
+  act on the live session exactly as on Android. Those controls send the same
+  `409` / `410` refusals, so a paused or cancelled transfer reads the same from
+  either device.
+* **Sending** — chunked uploads with offset negotiation, pause/resume from
+  either side, and the deliberate-refusal mapping.
+* **Packaged** — a PyInstaller one-dir build (`NexusFlow.spec`). A prebuilt copy
+  is committed at
+  **[`app-release/NexusFlow-Linux-x86_64.tar.gz`](app-release/)**
+  (~75 MB, unpack and run `./NexusFlow`). Requires a recent Python 3 runtime on
+  the target machine; it is not a static binary.
+
+Both receivers implement the same protocol, so any phone can send to any phone
+or to the Linux client, and the Linux client can send to a phone.
+
+**The most reliable way to demo across devices, on any network:**
+`adb reverse tcp:8000 tcp:8000` and point the app at `127.0.0.1:8000`. It does
+not depend on Wi-Fi at all, which matters because many institutional networks
+isolate clients from each other — there the app correctly reports "No devices
+found" rather than hanging, but a hotspot or a USB loopback is the answer.
 
 ---
 
