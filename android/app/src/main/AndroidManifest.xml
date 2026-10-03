@@ -96,6 +96,18 @@
             </intent-filter>
         </activity>
 
+        <!-- The QR scanner must follow the device.
+             The library's own manifest entry pins CaptureActivity to one
+             orientation, and ScanOptions.setOrientationLocked(false) only
+             clears the library's internal flag; it does not change the declared
+             activity orientation, so the viewfinder stayed landscape while the
+             phone was held upright. fullSensor lets it follow the device either
+             way round, including the reverse-portrait hold. -->
+        <activity
+            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:screenOrientation="fullSensor"
+            tools:replace="android:screenOrientation" />
+
         <service
             android:name=".TransferForegroundService"
             android:exported="false"
