@@ -96,6 +96,14 @@ time. A phone's Wi-Fi radio does not get faster by interleaving two 1 MB
 uploads, and a serial queue makes the resume logic tractable. Queued batches from
 the Sharesheet are sent one after another.
 
+**The queue is persisted, not just held in memory.** A batch's URIs are stored in
+order *together with which item is next* -- restoring the files without the
+position would silently resend from the top. A single `LaunchedEffect` watches the
+queue state, so none of the mutation sites can forget to save. On a cold start the
+queue is rebuilt the same way an interrupted transfer is, and entries whose staged
+copy Android reclaimed from `cacheDir` are dropped rather than offered. `QUEUED` is
+a real state in the enum, not an implicit one.
+
 ---
 
 ## Transfer protocol
@@ -128,10 +136,12 @@ reported as a connection error.
 
 State lives in two places, with different jobs.
 
-**SharedPreferences — the live transfer.** The session id, the URI, filename,
-size, peer, transferred byte count and status are written on every progress
-emission (rate-limited to once a second; always for a terminal status). This is
-what lets a killed app come back to a real percentage instead of an empty screen.
+**SharedPreferences — the live transfer and the queue.** The session id, the URI,
+filename, size, peer, transferred byte count and status are written on every
+progress emission (rate-limited to once a second; always for a terminal status).
+The queue's ordered URIs and its current position live here too. This is what lets
+a killed app come back to a real percentage, and its queue intact, instead of an
+empty screen.
 
 **SQLite (`HistoryStore`) — every transfer, ever.** Device-local, cumulative,
 and separate from the live session. A finished transfer is history; it must not
@@ -289,6 +299,8 @@ verification, and the kill-and-restore sequence quoted above.
 ## Known limitations
 
 - Sequential transfers, one at a time (a deliberate choice; see *Design decisions*).
+- The queue persists across process death, but a staged copy reclaimed by Android
+  from `cacheDir` cannot be recovered; that entry is dropped rather than faked.
 - Sessions live in memory on the receiver, so restarting the receiver loses them.
 - The receiver reuses one destination path per filename, so re-pushing an
   identical filename overwrites the earlier file.
