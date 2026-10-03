@@ -244,10 +244,22 @@ class MainActivity : ComponentActivity() {
         // device mid-transfer destroyed the transfer and lost the file
         // reference -- in a resumable transfer app.
         if (savedInstanceState == null) {
-            selectedFileName = null
-            selectedFileSize = null
-            selectedFileUri = null
-            transferManager.clearSavedSession()
+            // A cold start used to wipe the session outright, which is exactly
+            // the case the task cares about: kill the app at 40%, reopen it, and
+            // the transfer should still be at 40%. So try to restore first and
+            // only fall back to a clean slate when there is genuinely nothing in
+            // flight (fresh install, or the previous transfer finished).
+            val restored = transferManager.restoreSession()
+            if (restored) {
+                selectedFileUri = transferManager.getSavedFileUri()
+                selectedFileName = transferManager.getSavedFileName()
+                selectedFileSize = transferManager.getSavedFileSize()
+            } else {
+                selectedFileName = null
+                selectedFileSize = null
+                selectedFileUri = null
+                transferManager.clearSavedSession()
+            }
         } else {
             selectedFileUri = savedInstanceState.getString(STATE_URI)?.let(Uri::parse)
             selectedFileName = savedInstanceState.getString(STATE_FILENAME)

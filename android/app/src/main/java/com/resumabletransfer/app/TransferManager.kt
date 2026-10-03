@@ -41,6 +41,17 @@ class TransferManager private constructor(private val context: Context) {
         private const val KEY_CHUNK_SIZE_KB = "chunk_size_kb"
         private const val KEY_THROTTLE_DELAY_MS = "throttle_delay_ms"
 
+        // Persisted transfer state, so an interrupted transfer is still a
+        // transfer after the process dies. Requirement: state must not live only
+        // in the UI, and reopening the app must show the real progress rather
+        // than starting over.
+        private const val KEY_STATUS = "transfer_status"
+        private const val KEY_TRANSFERRED = "transfer_transferred_bytes"
+        private const val KEY_PEER_NAME = "transfer_peer_name"
+
+        /** Persisting every chunk would hammer the disk; once a second is plenty. */
+        private const val PERSIST_INTERVAL_MS = 1000L
+
         /**
          * Minimum gap between UI progress emissions. The transfer loop can
          * complete a 1 MB chunk every few ms on a fast link; emitting each one
@@ -218,6 +229,75 @@ class TransferManager private constructor(private val context: Context) {
      */
     fun updateProgress(update: (TransferProgress) -> TransferProgress) {
         _progressState.update(update)
+        persistProgress(_progressState.value)
+    }
+
+    /**
+     * Writes the current transfer to disk so it survives process death.
+     *
+     * Called on every emission but rate-limited to [PERSIST_INTERVAL_MS], plus
+     * always for a terminal status: a completed or cancelled transfer has to be
+     * recorded on the spot, not up to a second later.
+     */
+    private fun persistProgress(p: TransferProgress) {
+        val now = SystemClock.elapsedRealtime()
+        val terminal = p.status in TERMINAL_STATUSES
+        if (!terminal && now - lastPersistAt < PERSIST_INTERVAL_MS) return
+        lastPersistAt = now
+        // A transfer that has finished has nothing left to restore.
+        if (p.status == TransferStatus.COMPLETED || p.status == TransferStatus.CANCELLED) {
+            prefs.edit().remove(KEY_STATUS).remove(KEY_TRANSFERRED).apply()
+            return
+        }
+        prefs.edit()
+            .putString(KEY_STATUS, p.status.name)
+            .putLong(KEY_TRANSFERRED, p.transferredBytes)
+            .putString(KEY_PEER_NAME, currentPeerName)
+            .apply()
+    }
+
+    @Volatile
+    private var lastPersistAt = 0L
+
+    /**
+     * Rebuilds an interrupted transfer after the app was killed.
+     *
+     * Returns false when there is nothing to restore, so the caller can fall back
+     * to a clean slate. When it does return true the progress card shows the
+     * real percentage and the user resumes from the byte the receiver has
+     * confirmed -- not from zero.
+     *
+     * The status is reported as INTERRUPTED rather than whatever it was when the
+     * process died: a transfer that was mid-flight is no longer running, and
+     * claiming otherwise is how an app ends up showing a finished transfer that
+     * never happened.
+     */
+    fun restoreSession(): Boolean {
+        val uri = getSavedFileUri() ?: return false
+        val filename = getSavedFileName() ?: return false
+        val fileSize = getSavedFileSize() ?: return false
+        val transferId = prefs.getString(KEY_TRANSFER_ID, null)
+        if (transferId.isNullOrBlank()) return false
+
+        val persisted = prefs.getString(KEY_STATUS, TransferStatus.IDLE.name)
+        // A terminal status was already cleared by persistProgress; if one is
+        // here anyway, the process died between the last write and the clear.
+        if (persisted == TransferStatus.COMPLETED.name || persisted == TransferStatus.CANCELLED.name) {
+            return false
+        }
+
+        _progressState.value = TransferProgress(
+            status = TransferStatus.INTERRUPTED,
+            filename = filename,
+            totalBytes = fileSize,
+            transferredBytes = prefs.getLong(KEY_TRANSFERRED, 0L),
+            transferId = transferId,
+            expectedSha256 = prefs.getString(KEY_EXPECTED_SHA256, "") ?: "",
+            logMessage = "Restored an interrupted transfer. Tap Resume to continue from byte " +
+                "${prefs.getLong(KEY_TRANSFERRED, 0L)}."
+        )
+        currentPeerName = prefs.getString(KEY_PEER_NAME, "") ?: ""
+        return true
     }
 
     /**
@@ -240,6 +320,7 @@ class TransferManager private constructor(private val context: Context) {
         }
         lastEmitAt = now
         _progressState.value = next
+        persistProgress(next)
     }
 
     fun calculateSha256(uri: Uri): String {
