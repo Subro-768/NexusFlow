@@ -47,32 +47,30 @@ everything: open *Settings → Receiver → Demo Throttle Simulator*.
 
 ## Architecture
 
-```
-┌────────────────────────── Android (Kotlin / Jetpack Compose) ──────────────────────────┐
-│                                                                                        │
-│  UI (Compose)                    Core                          Data                   │
-│  ┌────────────────────┐    ┌──────────────────┐    ┌──────────────────────────┐      │
-│  │ SenderScreen        │    │ TransferManager   │───▶│ SharedPreferences         │      │
-│  │ ReceiverScreen      │◀──▶│  • state machine   │    │  • transfer_id            │      │
-│  │ TransferHistory     │    │  • chunk loop      │    │  • transferred_bytes      │      │
-│  │ SettingsScreen      │    │  • retry + resume  │    │  • status                 │      │
-│  └────────────────────┘    │  • sha-256         │    │  • uri, filename, size    │      │
-│                            └────────┬──────────┘    ├──────────────────────────┤      │
-│                                     │               │ HistoryStore (SQLite)    │      │
-│  TransferForegroundService ─────────┤               │  • every transfer, ever  │      │
-│  • WakeLock, WifiLock, START_STICKY │               └──────────────────────────┘      │
-│  • notification: pause / cancel    │                                                  │
-│                                     ▼                                                  │
-│                        TransferApiClient (OkHttp)                                      │
-└────────────────────────────────────┬───────────────────────────────────────────────────┘
-                                     │  HTTP/1.1 + JSON + octet-stream chunks
-                    ┌────────────────┴─────────────────┐
-                    ▼                                  ▼
-        ┌───────────────────────┐          ┌──────────────────────────┐
-        │ EmbeddedTransferServer│          │ EmbeddedReceiverServer   │
-        │ (Android, raw sockets)│          │ (Linux, http.server)     │
-        │  :8000, ThreadingMixIn│          │  :8000, threaded         │
-        └───────────────────────┘          └──────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph ANDROID["Android app &mdash; Kotlin / Jetpack Compose"]
+        UI["<b>UI (Compose)</b><br/>SenderScreen &middot; ReceiverScreen<br/>TransferHistory &middot; Settings"]
+        TM["<b>TransferManager</b><br/>state machine &middot; chunk loop<br/>retry + resume &middot; sha-256"]
+        FGS["<b>TransferForegroundService</b><br/>WakeLock &middot; WifiLock &middot; START_STICKY<br/>notification: pause / cancel"]
+        PREFS[("<b>SharedPreferences</b><br/>transfer_id &middot; transferred_bytes<br/>status &middot; uri, filename, size")]
+        DB[("<b>HistoryStore &mdash; SQLite</b><br/>every transfer, ever")]
+        API["<b>TransferApiClient</b> &mdash; OkHttp"]
+        UI <--> TM
+        FGS --> TM
+        TM --> PREFS
+        TM --> DB
+        TM --> API
+    end
+
+    WIRE["HTTP/1.1 &middot; JSON &middot; octet-stream chunks<br/>X-Start-Byte / X-End-Byte range headers"]
+
+    API --> WIRE
+    WIRE --> ASRV["<b>EmbeddedTransferServer</b><br/>Android receiver &middot; raw sockets<br/>:8000, threaded"]
+    WIRE --> LSRV["<b>EmbeddedReceiverServer</b><br/>Linux receiver &middot; http.server<br/>:8000, threaded"]
+
+    classDef store fill:#1f2937,stroke:#64748b,color:#e2e8f0
+    class PREFS,DB store
 ```
 
 Both receivers speak the same protocol (`docs/protocol.md`), so any phone can

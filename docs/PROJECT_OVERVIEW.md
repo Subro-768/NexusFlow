@@ -29,19 +29,18 @@ Sending large files (multi-gigabyte video recordings, archives, database backups
 
 ## 4. Architecture
 
-```text
-[ Android Client (Sender) ]
-          │  (0.001 ms FileChannel seek)
-          ▼
-[ HTTP/1.1 Chunk Streaming ] (X-Start-Byte, X-End-Byte, X-Total-Size)
-          │
-          ▼
-[ Receiver Server (PC FastAPI or Android Embedded Hub) ]
-          │
-    ┌─────┴────────────────┐
-    ▼                      ▼
-[ SQLite DB ]      [ RandomAccessFile ]
- (Atomic state)    (Direct disk write & fsync)
+```mermaid
+flowchart TB
+    A["<b>Android Client (Sender)</b><br/>FileChannel seek &mdash; sub-millisecond"]
+    H["<b>HTTP/1.1 Chunk Streaming</b><br/>X-Start-Byte &middot; X-End-Byte &middot; X-Total-Size"]
+    R["<b>Receiver Server</b><br/>PC FastAPI, or the Android Embedded Hub"]
+    DB[("<b>SQLite</b><br/>atomic state")]
+    RAF["<b>RandomAccessFile</b><br/>direct disk write + fsync"]
+
+    A -->|"0.001 ms seek"| H
+    H --> R
+    R --> DB
+    R --> RAF
 ```
 
 ---
