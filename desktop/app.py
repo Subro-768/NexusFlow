@@ -2244,6 +2244,61 @@ class ReceiverScreen(QWidget):
         status_row.addWidget(self.lbl_server_status)
         cl.addLayout(status_row)
 
+        # ── Endpoint (IP:port) dropdown ──────────────────────────────────────
+        # The address was removed from this screen earlier on privacy grounds:
+        # a shoulder-surfer or a screenshot should not hand over a LAN address.
+        # A collapsed disclosure puts it back for the cases that genuinely need
+        # it -- manual entry on a network where discovery fails, or debugging a
+        # pairing problem -- without putting it on screen by default.
+        self.btn_endpoint = QPushButton("▾  SHOW ENDPOINT (IP : PORT)")
+        self.btn_endpoint.setFixedHeight(32)
+        self.btn_endpoint.setCheckable(True)
+        # Checked gets its own pairing: the global QPushButton:checked rule is
+        # cyan-background-with-dark-text, which left the collapsed label almost
+        # unreadable once expanded.
+        self.btn_endpoint.setStyleSheet(f"""
+            QPushButton {{
+                color: {SOLORA_TEXT_SECONDARY};
+                border: 1px solid {SOLORA_BORDER};
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: bold;
+                font-size: {FS_SMALL};
+                text-align: left;
+            }}
+            QPushButton:hover {{ color: {SOLORA_CYAN}; border-color: {SOLORA_CYAN}; }}
+            QPushButton:checked {{
+                color: {SOLORA_CYAN};
+                border-color: {SOLORA_CYAN};
+                background-color: {alpha(SOLORA_CYAN, 0.10)};
+            }}
+        """)
+        self.btn_endpoint.setAccessibleName("Show this device's IP address and port")
+        self.btn_endpoint.toggled.connect(self._toggle_endpoint)
+        cl.addWidget(self.btn_endpoint)
+
+        self.endpoint_box = QFrame()
+        self.endpoint_box.setStyleSheet(f"""
+            QFrame {{
+                background-color: {alpha(SOLORA_SURFACE_ELEVATED, 0.6)};
+                border: 1px solid {alpha(SOLORA_CYAN, 0.25)};
+                border-radius: 8px;
+            }}
+        """)
+        self.endpoint_layout = QVBoxLayout(self.endpoint_box)
+        self.endpoint_layout.setContentsMargins(12, 10, 12, 10)
+        self.endpoint_layout.setSpacing(6)
+        self.lbl_endpoints = QLabel("")
+        self.lbl_endpoints.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-family: monospace; font-size: {FS_META};")
+        self.lbl_endpoints.setAccessibleName("This device's reachable addresses")
+        self.endpoint_layout.addWidget(self.lbl_endpoints)
+        hint = QLabel("Peers usually find you by name, so the address is only needed when discovery fails.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META};")
+        self.endpoint_layout.addWidget(hint)
+        cl.addWidget(self.endpoint_box)
+        self.endpoint_box.setVisible(False)
+
         # Show device name + port when enabled (instead of IP)
         self.lbl_broadcast_status = QLabel("Not broadcasting")
         self.lbl_broadcast_status.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_SMALL};")
@@ -2439,21 +2494,36 @@ class ReceiverScreen(QWidget):
         # off the GUI thread.
         self.refresh_received_files()
 
+    def _toggle_endpoint(self, expanded: bool):
+        """Show or hide the IP:port disclosure."""
+        self.endpoint_box.setVisible(expanded)
+        self.btn_endpoint.setText("▴  HIDE ENDPOINT (IP : PORT)" if expanded
+                                  else "▾  SHOW ENDPOINT (IP : PORT)")
+        if expanded:
+            self.refresh_ip()
+
     def refresh_ip(self):
         """Refresh the local address used for binding and pairing.
 
-        The address is no longer rendered anywhere: the old endpoint labels
-        were set here and then immediately blanked a few lines later, which was
-        the dead set-then-clear flagged in the audit. Only the pairing QR (which
-        now encodes the device name) and the instructions are updated.
+        The address is no longer rendered in the always-visible part of the
+        screen: the old endpoint labels were set here and then immediately
+        blanked a few lines later, which is the dead set-then-clear flagged in
+        the audit. It now appears only inside the collapsed endpoint dropdown.
         """
         ips = get_local_ips()
         self.current_ip = ips[0] if ips else "127.0.0.1"
+        port = getattr(self.server, "port", SETTINGS.port)
+        rows = [f"  {ip}:{port}" for ip in ips]
+        rows.append(f"  (no network address — listening locally only)"
+                    if not ips else "")
+        self.lbl_endpoints.setText("Reachable at:\n" + "\n".join(r for r in rows if r))
         self.lbl_device_identity.setText(
             f"<b style='color:{SOLORA_ENERGY_GREEN};'>Broadcasting as:</b> "
             f"<b style='color:{SOLORA_ENERGY_GREEN};'>{self._device_name}</b>"
         )
-        self.lbl_step2.setText(f"2. Tap your device name <b>{self._device_name}</b> on the sender device (auto-discovered).")
+        self.lbl_step2.setText(
+            f"2. Tap your device name <b>{self._device_name}</b> on the sender device (auto-discovered)."
+        )
         self.update_qr(build_pairing_name(self._device_name))
         self.ip_updated_signal.emit(self.current_ip)
 

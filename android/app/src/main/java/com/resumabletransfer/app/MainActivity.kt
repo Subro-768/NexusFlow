@@ -646,6 +646,10 @@ class MainActivity : ComponentActivity() {
                                     // Only while the endpoint is actually up:
                                     // a QR for a dead receiver sends the sender
                                     // straight into a connection failure.
+                                    endpointAddresses = remember(isReceiverRunning) {
+                                        embeddedServer?.getLocalIpAddresses().orEmpty()
+                                    },
+                                    port = DEFAULT_PORT,
                                     pairingPayload = if (isReceiverRunning) {
                                         buildPairingPayload(
                                             deviceName.ifBlank { transferManager.getDeviceName() }

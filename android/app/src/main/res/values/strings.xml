@@ -183,4 +183,8 @@
     <string name="receiver_pairing_code">PAIRING CODE</string>
     <string name="receiver_pairing_hint">On the sending device, tap Scan QR and point the camera at this code.</string>
     <string name="msg_pairing_name_not_found">Scanned \'%1$s\', but it is not in the nearby list yet. Waiting for discovery…</string>
+    <string name="receiver_show_endpoint">SHOW ENDPOINT (IP : PORT)</string>
+    <string name="receiver_hide_endpoint">HIDE ENDPOINT (IP : PORT)</string>
+    <string name="receiver_no_address">No network address yet — connect to Wi-Fi.</string>
+    <string name="receiver_endpoint_hint">Peers normally find you by name, so the address is only needed when discovery fails.</string>
 </resources>

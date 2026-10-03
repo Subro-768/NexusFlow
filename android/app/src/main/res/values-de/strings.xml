@@ -139,4 +139,8 @@
     <string name="receiver_pairing_code">KOPPLUNGS-CODE</string>
     <string name="receiver_pairing_hint">Tippe auf dem sendenden Gerät auf QR scannen und richte die Kamera auf diesen Code.</string>
     <string name="msg_pairing_name_not_found">\'%1$s\' gescannt, aber noch nicht in der Geräteliste. Warte auf die Suche…</string>
+    <string name="receiver_show_endpoint">ENDPOINT ANZEIGEN (IP : PORT)</string>
+    <string name="receiver_hide_endpoint">ENDPOINT AUSBLENDEN (IP : PORT)</string>
+    <string name="receiver_no_address">Noch keine Netzwerkadresse — mit WLAN verbinden.</string>
+    <string name="receiver_endpoint_hint">Geräte finden dich normalerweise beim Namen; die Adresse wird nur gebraucht, wenn die Suche scheitert.</string>
 </resources>

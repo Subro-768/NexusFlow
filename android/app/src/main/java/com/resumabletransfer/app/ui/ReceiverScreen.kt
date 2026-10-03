@@ -64,9 +64,18 @@ fun ReceiverScreen(
     onResumeIncoming: () -> Unit = {},
     onCancelIncoming: () -> Unit = {},
     /** `nexus://host:port` for this device, or null when it is not reachable. */
-    pairingPayload: String? = null
+    pairingPayload: String? = null,
+    /** `address:port` lines for the endpoint dropdown; empty until expanded. */
+    endpointAddresses: List<String> = emptyList(),
+    port: Int = 8000
 ) {
     val context = LocalContext.current
+
+    // Endpoint (IP:port) disclosure. The address was removed from this screen
+    // earlier because a screenshot or a shoulder-surfer should not hand over a
+    // LAN address; a collapsed dropdown brings it back for the cases that need
+    // it -- manual entry when discovery fails, and debugging a pairing problem.
+    var endpointOpen by remember { mutableStateOf(false) }
 
     var receivedFiles by remember { mutableStateOf(listOf<ReceivedFileInfo>()) }
 
@@ -225,6 +234,69 @@ fun ReceiverScreen(
                     }
 
                     HorizontalDivider(color = SoloraBorder)
+
+                    // ── Endpoint (IP:port) dropdown ──────────────────────────
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            if (endpointOpen) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = null,
+                            tint = SoloraTextSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            stringResource(
+                                if (endpointOpen) R.string.receiver_hide_endpoint
+                                else R.string.receiver_show_endpoint
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SoloraTextSecondary,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { endpointOpen = !endpointOpen }
+                        )
+                    }
+
+                    if (endpointOpen) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = SoloraSurfaceElevated,
+                            border = BorderStroke(1.dp, SoloraBorder),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                if (endpointAddresses.isEmpty()) {
+                                    Text(
+                                        stringResource(R.string.receiver_no_address),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = SoloraTextMuted
+                                    )
+                                } else {
+                                    endpointAddresses.forEach { addr ->
+                                        Text(
+                                            "$addr:$port",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = SoloraTextSecondary,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                                Text(
+                                    stringResource(R.string.receiver_endpoint_hint),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = SoloraTextMuted,
+                                    lineHeight = 15.sp
+                                )
+                            }
+                        }
+                    }
 
                     // Toggle row
                     Row(
