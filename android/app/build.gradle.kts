@@ -111,4 +111,10 @@ dependencies {
     // core is the encoder used to draw the pairing code on the receiver.
     implementation(libs.zxing.android.embedded)
     implementation(libs.zxing.core)
+
+    // Unit tests. Everything on the Android side was previously verified by hand
+    // over adb; these make the parts that are easy to get quietly wrong --
+    // token matching, payload encoding, resume offsets, the pre-flight decision
+    // -- repeatable instead.
+    testImplementation(libs.junit)
 }

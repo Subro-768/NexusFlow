@@ -359,7 +359,8 @@ tests/                       pytest suite + device repro scripts
 ## Tests
 
 ```bash
-python -m pytest tests -q     # 18 passed
+python -m pytest tests -q                  # 99 passed
+cd android && ./gradlew testDebugUnitTest  # 21 passed
 ```
 
 | Test | What it proves |
@@ -367,13 +368,25 @@ python -m pytest tests -q     # 18 passed
 | `test_server.py` | The HTTP protocol: sessions, chunking, offsets, resume |
 | `test_receiver_refusal.py` | `409`/`410` map to PAUSED/CANCELLED, and an unrelated `409` is *not* mislabelled |
 | `test_receiver_hold_cancel.py` | Real sockets: pause holds, resume finishes with matching SHA-256, cancel deletes the partial |
+| `test_receiver_auth.py` | An unauthenticated peer gets `401` from every data endpoint; a near-miss token is refused; `/health` leaks nothing; a restart invalidates the old code |
+| `test_path_traversal.py` | Hostile filenames reduce to a single path segment — checked against the running receiver, not just the helper |
+| `test_frozen_build.py` | The **packaged** binary, not the source tree: its bundle ships the modules imported by name and starts without a `ModuleNotFoundError` |
 | `test_linux_hub_controls.py` | The real Qt widgets drive a real transfer: pause stops the sender, resume completes it, cancel deletes the partial |
+| `ResumeAndPairingTest.kt` | Android: token generation and constant-time matching, pairing-payload encoding, resume offsets across chunk boundaries and past 2 GB, and the pre-flight decision |
 | `repro_cancel_race.py` | Cancelling mid-upload still yields a clean `410` |
 | `repro_cancel_race_device.py` | The same race against a real phone, over real Wi-Fi |
 
-The Android side was verified on a physical device (SM-A515F, Android 13)
-against the Linux receiver: pause/resume/cancel round trips, cross-device SHA-256
-verification, and the kill-and-restore sequence quoted above.
+`test_frozen_build.py` exists because of a bug it would have caught: an earlier
+PyInstaller build passed every source test and then died at startup with
+`ModuleNotFoundError: No module named 'auth_token'`, because PyInstaller follows
+neither a `sys.path` insertion nor a module named by a string. Anything asserting
+against `dist/` rather than the source tree is the only kind that notices.
+
+The Android UI was additionally verified on a physical device (SM-A515F, Android
+13) against the Linux receiver: pause/resume/cancel round trips, cross-device
+SHA-256 verification, the kill-and-restore sequence quoted above, and a
+minified release install checked for the `NoClassDefFoundError` failures that
+only appear once R8 is enabled.
 
 ---
 

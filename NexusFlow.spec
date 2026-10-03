@@ -5,8 +5,13 @@ a = Analysis(
     ['desktop/app.py'],
     pathex=[],
     binaries=[],
-    datas=[('desktop', 'desktop')],
-    hiddenimports=['qrcode', 'PIL', 'PyQt6'],
+    # 'desktop' ships as data because desktop/ is also where the app looks for
+    # its assets at runtime. auth_token and safe_filename are imported by *name*
+    # from modules that live in it, which PyInstaller's static analysis does not
+    # follow across the sys.path manipulation those modules do -- so without them
+    # named here the frozen build fails at startup with ModuleNotFoundError.
+    datas=[('desktop', 'desktop'), ('auth_token.py', '.'), ('safe_filename.py', '.')],
+    hiddenimports=['qrcode', 'PIL', 'PyQt6', 'auth_token', 'safe_filename'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
