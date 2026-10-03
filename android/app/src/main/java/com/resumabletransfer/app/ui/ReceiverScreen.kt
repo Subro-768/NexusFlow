@@ -65,8 +65,8 @@ fun ReceiverScreen(
     onCancelIncoming: () -> Unit = {},
     /** `nexus://host:port` for this device, or null when it is not reachable. */
     pairingPayload: String? = null,
-    /** `address:port` lines for the endpoint dropdown; empty until expanded. */
-    endpointAddresses: List<String> = emptyList(),
+    /** Live supplier for the dropdown: called when it is opened, not cached. */
+    localAddresses: () -> List<String> = { emptyList() },
     port: Int = 8000
 ) {
     val context = LocalContext.current
@@ -76,6 +76,14 @@ fun ReceiverScreen(
     // LAN address; a collapsed dropdown brings it back for the cases that need
     // it -- manual entry when discovery fails, and debugging a pairing problem.
     var endpointOpen by remember { mutableStateOf(false) }
+
+    // Re-read on open rather than caching once. A device that joins a different
+    // network while receiving stays enabled would otherwise keep showing the
+    // address it had when the Hub was first built.
+    var endpointAddresses by remember { mutableStateOf(emptyList<String>()) }
+    LaunchedEffect(endpointOpen, isServerRunning) {
+        if (endpointOpen) endpointAddresses = localAddresses()
+    }
 
     var receivedFiles by remember { mutableStateOf(listOf<ReceivedFileInfo>()) }
 

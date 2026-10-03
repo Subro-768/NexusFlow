@@ -2513,10 +2513,14 @@ class ReceiverScreen(QWidget):
         ips = get_local_ips()
         self.current_ip = ips[0] if ips else "127.0.0.1"
         port = getattr(self.server, "port", SETTINGS.port)
-        rows = [f"  {ip}:{port}" for ip in ips]
-        rows.append(f"  (no network address — listening locally only)"
-                    if not ips else "")
-        self.lbl_endpoints.setText("Reachable at:\n" + "\n".join(r for r in rows if r))
+        # Loopback is not a way to reach this device from another one, so it is
+        # filtered out of a list whose whole purpose is "type this elsewhere".
+        reachable = [ip for ip in ips if not ip.startswith("127.")]
+        if reachable:
+            body = "\n".join(f"  {ip}:{port}" for ip in reachable)
+        else:
+            body = "  No network address yet — connect to Wi-Fi."
+        self.lbl_endpoints.setText(f"Reachable at:\n{body}")
         self.lbl_device_identity.setText(
             f"<b style='color:{SOLORA_ENERGY_GREEN};'>Broadcasting as:</b> "
             f"<b style='color:{SOLORA_ENERGY_GREEN};'>{self._device_name}</b>"

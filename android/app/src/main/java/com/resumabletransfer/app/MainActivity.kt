@@ -46,6 +46,7 @@ import com.resumabletransfer.app.ui.formatFileSize
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -61,6 +62,9 @@ private const val NEXUS_SCHEME = "nexus://"
 
 /** Name-only pairing form, matching the Linux Hub's QR. See applyPairingUri. */
 private const val RECEIVE_SCHEME = "nexus://receive/"
+
+/** How long a scanned name is polled for in the discovery list. */
+private const val PAIRING_LOOKUP_MS = 12_000L
 
 /**
  * The pairing payload this device shows as a QR.
@@ -196,15 +200,40 @@ class MainActivity : ComponentActivity() {
                         "UTF-8"
                     )
                 }.getOrElse { uri.removePrefix(RECEIVE_SCHEME).substringBefore('?').trim('/') }
-                val peer = discoveredPeers.firstOrNull { it.name == wanted }
+                // Name matching is tolerant: discovery reports whatever the peer
+                // advertised, which need not match the QR byte for byte on case
+                // or surrounding space.
+                fun findPeer() = discoveredPeers.firstOrNull {
+                    it.name.trim().equals(wanted.trim(), ignoreCase = true)
+                }
+                val peer = findPeer()
                 if (peer != null) {
                     host = peer.host
                     port = peer.port
                 } else {
-                    // Discovery has not seen it (yet). Say so instead of guessing
-                    // an address -- a wrong host fails later and less clearly.
-                    notifyUser(getString(R.string.msg_pairing_name_not_found, wanted))
+                    // Discovery has not seen it yet, and it usually appears a
+                    // second or two later. Rescanning and giving up meant a user
+                    // who scanned slightly early had to scan again, so poll for a
+                    // bounded while instead -- and still never guess an address.
+                    notifyUser(getString(R.string.msg_pairing_searching, wanted))
                     rescanPeers()
+                    lifecycleScope.launch {
+                        val deadline = System.currentTimeMillis() + PAIRING_LOOKUP_MS
+                        while (System.currentTimeMillis() < deadline) {
+                            delay(500)
+                            val found = findPeer() ?: continue
+                            serverIp = found.host
+                            found.port.let { serverPort = it.toString() }
+                            transferManager.setSavedServerIp(found.host)
+                            transferManager.setSavedServerPort(serverPort)
+                            notifyUser(
+                                getString(R.string.msg_pairing_connected, found.host, serverPort)
+                            )
+                            testConnection()
+                            return@launch
+                        }
+                        notifyUser(getString(R.string.msg_pairing_name_not_found, wanted))
+                    }
                     return
                 }
             }
@@ -646,7 +675,12 @@ class MainActivity : ComponentActivity() {
                                     // Only while the endpoint is actually up:
                                     // a QR for a dead receiver sends the sender
                                     // straight into a connection failure.
-                                    endpointAddresses = remember(isReceiverRunning) {
+                                    // Refreshed by the Hub when the dropdown is
+                                    // actually opened, not captured once here:
+                                    // remember(isReceiverRunning) froze the list,
+                                    // so joining a different Wi-Fi while
+                                    // receiving showed the old address.
+                                    localAddresses = {
                                         embeddedServer?.getLocalIpAddresses().orEmpty()
                                     },
                                     port = DEFAULT_PORT,

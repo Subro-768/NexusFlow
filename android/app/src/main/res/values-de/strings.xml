@@ -143,4 +143,5 @@
     <string name="receiver_hide_endpoint">ENDPOINT AUSBLENDEN (IP : PORT)</string>
     <string name="receiver_no_address">Noch keine Netzwerkadresse — mit WLAN verbinden.</string>
     <string name="receiver_endpoint_hint">Geräte finden dich normalerweise beim Namen; die Adresse wird nur gebraucht, wenn die Suche scheitert.</string>
+    <string name="msg_pairing_searching">Suche nach \'%1$s\' im Netzwerk\u2026</string>
 </resources>
