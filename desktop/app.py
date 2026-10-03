@@ -2433,14 +2433,81 @@ class ReceiverScreen(QWidget):
             btn_open.clicked.connect(lambda _, p=fpath: open_file_or_dir(p))
             rl.addWidget(btn_open)
 
-            btn_show_folder = QPushButton("📂")
-            btn_show_folder.setFixedSize(32, 32)
+            # "DIR" rather than the 📂 emoji: this Qt build has no emoji font,
+            # so U+1F4C1 rendered as an empty box -- the same failure the delete
+            # button hit, which left two identical blank buttons next to each
+            # other. Verified against the running font: U+2716 and plain text
+            # render, U+1F4C1 and U+1F5D1 do not.
+            btn_show_folder = QPushButton("DIR")
+            btn_show_folder.setFixedSize(42, 32)
             btn_show_folder.setToolTip("Show in file manager")
             btn_show_folder.setStyleSheet(f"background-color: {SOLORA_SURFACE_CARD}; color: {SOLORA_TEXT_SECONDARY}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-size: 10pt;")
             btn_show_folder.clicked.connect(lambda _, p=upload_dir: open_file_or_dir(p))
             rl.addWidget(btn_show_folder)
 
+            btn_delete = QPushButton("✖")
+            btn_delete.setFixedSize(42, 32)
+            btn_delete.setToolTip("Delete this file from disk")
+            btn_delete.setStyleSheet(f"background-color: {SOLORA_SURFACE_CARD}; color: {SOLORA_ALERT_RED}; border: 1px solid {SOLORA_ALERT_RED}; border-radius: 6px; font-size: 10pt;")
+            btn_delete.clicked.connect(
+                lambda _, p=fpath, n=fname: self.delete_received_file(p, n)
+            )
+            rl.addWidget(btn_delete)
+
             self.files_layout.addWidget(row_card)
+
+    def delete_received_file(self, filepath: str, display_name: str = ""):
+        """Delete a received file after an explicit confirmation.
+
+        Receiving a file put it on this machine, and there was no way to undo
+        that: the row offered only Open and Show-in-folder, so the only options
+        were a file manager or deleting things by hand. This is the obvious
+        omission.
+
+        Confirmed first, and it says what it is about to destroy. Deletion is
+        permanent and there is no trash, so a single mis-click must not be
+        able to lose a 2 GB download.
+        """
+        name = display_name or os.path.basename(filepath)
+        try:
+            size = os.path.getsize(filepath)
+        except OSError:
+            size = 0
+
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Delete received file?")
+        confirm.setIcon(QMessageBox.Icon.Warning)
+        confirm.setText(f"Delete “{name}” from this computer?")
+        confirm.setInformativeText(
+            f"{format_size(size)}\n{filepath}\n\n"
+            "This cannot be undone — the file is not moved to a trash folder."
+        )
+        confirm.setStandardButtons(
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes
+        )
+        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            os.remove(filepath)
+        except FileNotFoundError:
+            # Someone got there first. Not an error worth a dialog.
+            pass
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Could not delete",
+                f"“{name}” could not be deleted:\n\n{exc}\n\n"
+                "Check the file's permissions and try again.",
+            )
+            return
+
+        # The history row is deliberately left alone: it records that a transfer
+        # happened and verified, which is still true. Its Open File button
+        # already hides itself for a path that no longer exists.
+        self.refresh_received_files()
+        self.lbl_payload_info.setText(f"Deleted “{name}” from this computer.")
 
     def update_qr(self, text):
         try:
