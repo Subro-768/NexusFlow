@@ -64,6 +64,7 @@
     <string name="log_prefix">&gt; %1$s</string>
 
     <!-- Status badges -->
+    <string name="status_queued">Queued</string>
     <string name="status_idle">STANDBY</string>
     <string name="status_connecting">CONNECTING…</string>
     <string name="status_ready">READY</string>

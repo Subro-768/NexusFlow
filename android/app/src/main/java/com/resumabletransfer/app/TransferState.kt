@@ -4,6 +4,15 @@ import androidx.compose.runtime.Immutable
 
 enum class TransferStatus {
     IDLE,
+    /**
+     * Accepted and persisted, not started yet.
+     *
+     * A real state rather than an implicit one: a queued item is not "idle" (it
+     * has a file and a destination) and not "transferring", and the task asks for
+     * QUEUED -> TRANSFERRING -> COMPLETED explicitly. It exists so a queue can
+     * outlive the process with its order and position intact.
+     */
+    QUEUED,
     CONNECTING,
     READY,
     TRANSFERRING,

@@ -1264,6 +1264,9 @@ internal fun TransferStatus.accentColor(): Color = when (this) {
     TransferStatus.INTERRUPTED, TransferStatus.FAILED -> SoloraAlertRed
     TransferStatus.PAUSED -> SoloraSolarAmber
     TransferStatus.CONNECTING -> SoloraCyan
+    // Queued: accepted and persisted, not started. Cyan, because it is waiting on
+    // the same thing a connecting transfer is.
+    TransferStatus.QUEUED -> SoloraCyan
     TransferStatus.IDLE, TransferStatus.CANCELLED -> SoloraTextMuted
     TransferStatus.TRANSFERRING -> SoloraNeonLime
 }
@@ -1271,6 +1274,7 @@ internal fun TransferStatus.accentColor(): Color = when (this) {
 /** Maps a status to its localized badge label. */
 internal fun TransferStatus.labelRes(): Int = when (this) {
     TransferStatus.IDLE -> R.string.status_idle
+    TransferStatus.QUEUED -> R.string.status_queued
     TransferStatus.CONNECTING -> R.string.status_connecting
     TransferStatus.READY -> R.string.status_ready
     TransferStatus.TRANSFERRING -> R.string.status_transferring

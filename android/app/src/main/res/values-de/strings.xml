@@ -38,6 +38,7 @@
     <string name="sha_verified">SHA-256 zu 100 % geprüft</string>
     <string name="toast_hash_copied">Hash in die Zwischenablage kopiert</string>
 
+    <string name="status_queued">Queued</string>
     <string name="status_idle">BEREIT</string>
     <string name="status_connecting">VERBINDEN…</string>
     <string name="status_ready">BEREIT</string>

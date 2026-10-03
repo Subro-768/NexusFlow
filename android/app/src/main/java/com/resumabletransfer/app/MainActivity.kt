@@ -260,6 +260,24 @@ class MainActivity : ComponentActivity() {
                 selectedFileUri = null
                 transferManager.clearSavedSession()
             }
+
+            // Same reasoning for the queue. savedInstanceState only covers a
+            // configuration change, so a killed process used to lose the whole
+            // batch. Entries whose staged copy the system reclaimed are dropped
+            // rather than offered: a queue row pointing at a file that cannot be
+            // read is worse than a shorter honest queue.
+            val (persistedUris, persistedIndex) = transferManager.loadQueue()
+            persistedUris.forEach { raw ->
+                val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return@forEach
+                if (SharedFileStager.stagedFileFor(applicationContext, uri) != null) {
+                    sharedFiles = sharedFiles + SharedFileStager.describeExisting(
+                        applicationContext, uri
+                    )
+                }
+            }
+            if (sharedFiles.isNotEmpty()) {
+                sharedQueueIndex = persistedIndex.coerceIn(0, sharedFiles.lastIndex)
+            }
         } else {
             selectedFileUri = savedInstanceState.getString(STATE_URI)?.let(Uri::parse)
             selectedFileName = savedInstanceState.getString(STATE_FILENAME)
@@ -317,6 +335,22 @@ class MainActivity : ComponentActivity() {
                 // transition, not on every recomposition.
                 LaunchedEffect(progress.status) {
                     maybeAdvanceSharedQueue(progress.status)
+                }
+
+                // Persist the queue whenever its contents or position change,
+                // from whichever of the seven mutation sites did it. Watching the
+                // two state values here means no new queue code path can forget
+                // to save -- the bug this replaces was a queue that survived a
+                // rotation but not a process kill.
+                LaunchedEffect(sharedFiles, sharedQueueIndex) {
+                    if (sharedFiles.isEmpty()) {
+                        transferManager.clearQueue()
+                    } else {
+                        transferManager.saveQueue(
+                            sharedFiles.map { it.uri.toString() },
+                            sharedQueueIndex
+                        )
+                    }
                 }
 
                 BackHandler(enabled = drawerState.isOpen || currentScreen != ScreenNav.TRANSFER) {

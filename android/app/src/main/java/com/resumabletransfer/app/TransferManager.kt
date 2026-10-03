@@ -52,6 +52,10 @@ class TransferManager private constructor(private val context: Context) {
         /** Persisting every chunk would hammer the disk; once a second is plenty. */
         private const val PERSIST_INTERVAL_MS = 1000L
 
+        /** The queued batch: URIs in order, plus which one is next. */
+        private const val KEY_QUEUE_URIS = "queue_uris"
+        private const val KEY_QUEUE_INDEX = "queue_index"
+
         /**
          * Minimum gap between UI progress emissions. The transfer loop can
          * complete a 1 MB chunk every few ms on a fast link; emitting each one
@@ -244,9 +248,18 @@ class TransferManager private constructor(private val context: Context) {
         val terminal = p.status in TERMINAL_STATUSES
         if (!terminal && now - lastPersistAt < PERSIST_INTERVAL_MS) return
         lastPersistAt = now
-        // A transfer that has finished has nothing left to restore.
+        // A transfer that has finished has nothing left to restore. The
+        // transfer id goes too: leaving it behind made a *completed* transfer
+        // reappear as "INTERRUPTED 0%" on the next cold start, offering a
+        // Resume for work that was already done.
         if (p.status == TransferStatus.COMPLETED || p.status == TransferStatus.CANCELLED) {
-            prefs.edit().remove(KEY_STATUS).remove(KEY_TRANSFERRED).apply()
+            prefs.edit()
+                .remove(KEY_STATUS)
+                .remove(KEY_TRANSFERRED)
+                .apply()
+            if (p.status == TransferStatus.COMPLETED) {
+                prefs.edit().remove(KEY_TRANSFER_ID).apply()
+            }
             return
         }
         prefs.edit()
@@ -321,6 +334,39 @@ class TransferManager private constructor(private val context: Context) {
         lastEmitAt = now
         _progressState.value = next
         persistProgress(next)
+    }
+
+    /**
+     * Persists the queue itself, so a queued batch survives process death.
+     *
+     * The Sharesheet queue used to live only in savedInstanceState, which covers
+     * a rotation but not the process being killed -- exactly the case the task
+     * cares about. Order and position are both stored: restoring the files but
+     * not "which one was next" would silently resend from the top.
+     *
+     * Only URIs are stored, never the staged bytes. The staged copy lives in
+     * cacheDir and the system may reclaim it, so [loadQueue] hands back what can
+     * still be re-staged and the caller drops the rest rather than offering a
+     * file it cannot send.
+     */
+    fun saveQueue(uris: List<String>, currentIndex: Int) {
+        prefs.edit()
+            .putString(KEY_QUEUE_URIS, uris.joinToString("\n"))
+            .putInt(KEY_QUEUE_INDEX, currentIndex)
+            .apply()
+    }
+
+    /** Persisted queue as (uris, currentIndex); empty when nothing was queued. */
+    fun loadQueue(): Pair<List<String>, Int> {
+        val raw = prefs.getString(KEY_QUEUE_URIS, "") ?: ""
+        val uris = raw.split('\n').map { it.trim() }.filter { it.isNotEmpty() }
+        if (uris.isEmpty()) return emptyList<String>() to 0
+        val index = prefs.getInt(KEY_QUEUE_INDEX, 0).coerceIn(0, uris.lastIndex)
+        return uris to index
+    }
+
+    fun clearQueue() {
+        prefs.edit().remove(KEY_QUEUE_URIS).remove(KEY_QUEUE_INDEX).apply()
     }
 
     fun calculateSha256(uri: Uri): String {
