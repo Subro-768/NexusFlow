@@ -96,6 +96,19 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Handles the incoming-file notification's Pause / Resume / Cancel
+             buttons. Not exported: the actions only mean anything inside this
+             process, where the receive endpoint lives. -->
+        <receiver
+            android:name=".ReceiveActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.resumabletransfer.app.RECEIVE_PAUSE" />
+                <action android:name="com.resumabletransfer.app.RECEIVE_RESUME" />
+                <action android:name="com.resumabletransfer.app.RECEIVE_CANCEL" />
+            </intent-filter>
+        </receiver>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

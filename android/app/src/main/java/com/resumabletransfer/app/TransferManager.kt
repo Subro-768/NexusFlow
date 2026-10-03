@@ -48,6 +48,17 @@ class TransferManager private constructor(private val context: Context) {
          */
         const val PROGRESS_EMIT_INTERVAL_MS = 120L
 
+        /**
+         * Markers the receiver puts in the `detail` of a refused chunk, and
+         * which therefore show up inside the error message built by
+         * [TransferApiClient.uploadChunk].
+         *
+         * They are part of the wire contract with the desktop client, so both
+         * sides must agree on the exact strings; see docs/protocol.md.
+         */
+        const val RECEIVER_PAUSED_MARKER = "transfer_paused"
+        const val RECEIVER_CANCELLED_MARKER = "transfer_cancelled"
+
         /** Statuses that must reach the UI immediately, never throttled. */
         private val TERMINAL_STATUSES = setOf(
             TransferStatus.COMPLETED,
@@ -81,6 +92,31 @@ class TransferManager private constructor(private val context: Context) {
     private var activeApiClient: TransferApiClient? = null
     @Volatile private var isPaused = false
     @Volatile private var isCancelled = false
+
+    /**
+     * What the running (or last) transfer was started with.
+     *
+     * Pause and resume must work from a notification action, where no Activity
+     * exists to supply the URI, file name, size and peer. Captured once at
+     * [startTransfer] so the service can restart an interrupted send without
+     * asking the UI for parameters it no longer has.
+     */
+    private data class ActiveSpec(
+        val serverUrl: String,
+        val uri: Uri,
+        val filename: String,
+        val fileSize: Long,
+        val peerName: String
+    )
+
+    @Volatile
+    private var activeSpec: ActiveSpec? = null
+
+    /** Statuses where a pause/resume request is meaningful. */
+    private val PAUSABLE_STATUSES = setOf(
+        TransferStatus.CONNECTING,
+        TransferStatus.TRANSFERRING
+    )
 
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -246,6 +282,8 @@ class TransferManager private constructor(private val context: Context) {
         currentPeerPort = Uri.parse(serverUrl).port.takeIf { it > 0 } ?: 8000
         currentPeerName = peerDisplayName
 
+        activeSpec = ActiveSpec(serverUrl, uri, filename, fileSize, peerDisplayName)
+
         transferJob = coroutineScope.launch {
             val client = TransferApiClient(serverUrl)
             activeApiClient = client
@@ -396,6 +434,14 @@ class TransferManager private constructor(private val context: Context) {
                 var lastSpeedCalcTime = System.currentTimeMillis()
                 var bytesSinceSpeedCalc = 0L
 
+                // Set when the *receiver* refuses the chunk because it was
+                // paused or cancelled on that device. Distinct from a network
+                // failure: the peer is reachable and made a decision, so the
+                // session is still resumable and must not be reported as an
+                // interruption.
+                var peerPaused = false
+                var peerCancelled = false
+
                 while (currentOffset < fileSize && !isCancelled) {
                     if (isPaused) {
                         updateProgress {
@@ -444,7 +490,8 @@ class TransferManager private constructor(private val context: Context) {
                     var retryCount = 0
                     val maxRetries = 2
 
-                    while (!chunkSuccess && retryCount < maxRetries && !isCancelled && !isPaused) {
+                    while (!chunkSuccess && retryCount < maxRetries && !isCancelled && !isPaused
+                            && !peerPaused && !peerCancelled) {
                         val uploadRes = client.uploadChunk(transferId, startByte, endByte, fileSize, chunkData)
                         if (uploadRes.isSuccess) {
                             val result = uploadRes.getOrThrow()
@@ -510,6 +557,19 @@ class TransferManager private constructor(private val context: Context) {
                         } else {
                             retryCount++
                             val err = uploadRes.exceptionOrNull()?.localizedMessage ?: "Network connection lost"
+                            // The receiver refused deliberately (409/410), so
+                            // retrying is pointless and would burn the retries
+                            // on a decision the user made on the other device.
+                            if (err.contains(RECEIVER_PAUSED_MARKER)) {
+                                peerPaused = true
+                                Log.i(TAG, "Receiver paused this transfer at offset $confirmedOffset")
+                                break
+                            }
+                            if (err.contains(RECEIVER_CANCELLED_MARKER)) {
+                                peerCancelled = true
+                                Log.i(TAG, "Receiver cancelled this transfer at offset $confirmedOffset")
+                                break
+                            }
                             updateProgressThrottled {
                                 it.copy(
                                     logMessage = "Interruption detected: $err"
@@ -519,6 +579,32 @@ class TransferManager private constructor(private val context: Context) {
                                 delay(600L * retryCount)
                             }
                         }
+                    }
+
+                    if (peerPaused) {
+                        // The peer is holding the session open. Keep the
+                        // transfer id so Resume picks up at the same offset
+                        // instead of re-uploading from zero.
+                        val pct = if (fileSize > 0) (confirmedOffset * 100 / fileSize).toInt() else 0
+                        updateProgress {
+                            it.copy(
+                                status = TransferStatus.PAUSED,
+                                logMessage = "Paused by the receiving device at $pct%. " +
+                                    "Resume here, or resume it on that device."
+                            )
+                        }
+                        return@launch
+                    }
+
+                    if (peerCancelled) {
+                        prefs.edit().remove(KEY_TRANSFER_ID).remove(KEY_EXPECTED_SHA256).apply()
+                        updateProgress {
+                            it.copy(
+                                status = TransferStatus.CANCELLED,
+                                logMessage = "The receiving device cancelled this transfer."
+                            )
+                        }
+                        return@launch
                     }
 
                     if (!chunkSuccess && !isCancelled && !isPaused) {
@@ -609,9 +695,54 @@ class TransferManager private constructor(private val context: Context) {
         }
     }
 
-    fun pauseTransfer() {
+    /**
+ * Pauses a running send.
+ *
+ * Guarded on [PAUSABLE_STATUSES]: an unconditional flag used to be able to
+ * overwrite INTERRUPTED or COMPLETED with PAUSED, which a notification action
+ * could then re-label a finished transfer as resumable.
+ */
+fun pauseTransfer() {
+    if (_progressState.value.status !in PAUSABLE_STATUSES) return
         isPaused = true
         updateProgress { it.copy(status = TransferStatus.PAUSED, logMessage = "Transfer paused.") }
+    }
+
+    /**
+     * Resume driven from outside the UI (the notification's Resume action).
+     *
+     * Two cases, and they need different handling:
+     *  * PAUSED -- the chunk loop is still parked on the pause flag, so clearing
+     *    it continues the upload at the current offset. Restarting the job here
+     *    would renegotiate the session for nothing.
+     *  * INTERRUPTED -- the loop has already exited, so the transfer has to be
+     *    started again from [activeSpec].
+     *
+     * Returns false when there is nothing to resume, so the caller can say so
+     * rather than leaving a dead Resume button that does nothing.
+     */
+    fun resumeActiveTransfer(): Boolean {
+        when (_progressState.value.status) {
+            TransferStatus.PAUSED -> {
+                isPaused = false
+                updateProgress {
+                    it.copy(status = TransferStatus.TRANSFERRING, logMessage = "Transfer resumed.")
+                }
+                return true
+            }
+            TransferStatus.INTERRUPTED -> {
+                val spec = activeSpec ?: return false
+                resumeTransfer(
+                    serverUrl = spec.serverUrl,
+                    uri = spec.uri,
+                    filename = spec.filename,
+                    fileSize = spec.fileSize,
+                    peerDisplayName = spec.peerName
+                )
+                return true
+            }
+            else -> return false
+        }
     }
 
     fun resumeTransfer(

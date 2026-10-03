@@ -512,6 +512,28 @@ class MainActivity : ComponentActivity() {
                                     onDeviceNameChange = { newName ->
                                         deviceName = newName
                                         transferManager.setDeviceName(newName)
+                                    },
+                                    // These act on the live session rather than on
+                                    // the toggle: pausing stops the bytes while
+                                    // keeping the peer addressable, so the sender
+                                    // can pick the same offset back up on Resume.
+                                    onPauseIncoming = {
+                                        val id = incomingTransfer?.transferId
+                                        if (id != null && embeddedServer?.pauseIncoming(id) == true) {
+                                            notifyUser(getString(R.string.msg_incoming_paused))
+                                        }
+                                    },
+                                    onResumeIncoming = {
+                                        val id = incomingTransfer?.transferId
+                                        if (id != null && embeddedServer?.resumeIncoming(id) == true) {
+                                            notifyUser(getString(R.string.msg_incoming_resumed))
+                                        }
+                                    },
+                                    onCancelIncoming = {
+                                        val id = incomingTransfer?.transferId
+                                        if (id != null && embeddedServer?.cancelIncoming(id) == true) {
+                                            notifyUser(getString(R.string.msg_incoming_cancelled))
+                                        }
                                     }
                                 )
                             }

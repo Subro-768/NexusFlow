@@ -149,4 +149,32 @@
         <item quantity="one">%1$d byte remaining</item>
         <item quantity="other">%1$d bytes remaining</item>
     </plurals>
+
+    <!-- Transfer controls: shared by the notification actions and the Hub -->
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_cancel">Cancel</string>
+
+    <!-- Outgoing transfer notification -->
+    <string name="notify_transfer_title">File transfer</string>
+    <string name="notify_connecting">Connecting…</string>
+    <string name="notify_paused_detail">Paused — %1$s / %2$s MB</string>
+    <string name="notify_eta_suffix">%1$s left</string>
+
+    <!-- Incoming transfer notification -->
+    <string name="recv_channel_name">Incoming files</string>
+    <string name="recv_channel_description">Progress for files other devices push to this phone</string>
+    <string name="recv_notification_paused_detail">Paused — nothing is being written</string>
+    <string name="recv_notification_done_verified">Received and SHA-256 verified</string>
+    <string name="recv_notification_done_unverified">Received — checksum did not match</string>
+    <string name="recv_notification_cancelled">Receive cancelled</string>
+    <string name="recv_notification_failed">Receive failed</string>
+    <string name="recv_notification_eta">%1$s left</string>
+
+    <!-- Receiver Hub: live incoming transfer -->
+    <string name="receiver_time_left">%1$s left at this rate</string>
+    <string name="receiver_paused_note">Holding at the current offset. The sending device waits and picks up exactly here when you resume.</string>
+    <string name="msg_incoming_paused">Incoming transfer paused</string>
+    <string name="msg_incoming_resumed">Incoming transfer resumed</string>
+    <string name="msg_incoming_cancelled">Incoming transfer cancelled — the partial file was deleted</string>
 </resources>

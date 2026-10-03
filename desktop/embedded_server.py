@@ -111,6 +111,68 @@ class EmbeddedReceiverServer:
         except Exception:
             pass
 
+    # ── Receiver-side hold / release / cancel ────────────────────────────────
+    #
+    # Mirrors the Android receiver so either device can stop a push, and so the
+    # 409/410 contract in docs/protocol.md is implemented on both ends rather
+    # than only where it was first needed.
+
+    def _refusal_marker_for(self, transfer_id: str) -> Optional[str]:
+        """Why this session must not accept a chunk, or None if it may."""
+        rec = self.transfers.get(transfer_id)
+        if not rec:
+            return None
+        if rec.get("cancelled"):
+            return "transfer_cancelled"
+        if rec.get("paused"):
+            return "transfer_paused"
+        return None
+
+    def pause_transfer(self, transfer_id: str) -> bool:
+        with self._transfers_lock:
+            rec = self.transfers.get(transfer_id)
+            if not rec or rec.get("cancelled") or rec.get("status") == "completed":
+                return False
+            rec["paused"] = True
+            rec["status"] = "paused"
+        self._notify_state(rec)
+        return True
+
+    def resume_transfer(self, transfer_id: str) -> bool:
+        with self._transfers_lock:
+            rec = self.transfers.get(transfer_id)
+            if not rec or rec.get("cancelled"):
+                return False
+            rec["paused"] = False
+            rec["status"] = ("completed" if rec["received_bytes"] >= rec["total_size"]
+                             else "in_progress")
+        self.speed_trackers.drop(transfer_id)  # re-measure rather than reuse the old rate
+        self._notify_state(rec)
+        return True
+
+    def cancel_transfer(self, transfer_id: str) -> bool:
+        """End the session and delete the partial file.
+
+        The destination is preallocated to the full size, so leaving it behind
+        would show a full-size file of zeros in the Received list.
+        """
+        with self._transfers_lock:
+            rec = self.transfers.get(transfer_id)
+            if not rec:
+                return False
+            was_complete = rec.get("status") == "completed"
+            rec["cancelled"] = True
+            rec["paused"] = False
+            rec["status"] = "cancelled"
+        if not was_complete:
+            try:
+                os.remove(rec["file_path"])
+            except OSError:
+                pass
+        self.speed_trackers.drop(transfer_id)
+        self._notify_state(rec)
+        return True
+
     def start(self) -> bool:
         if self.is_running:
             return True
@@ -120,6 +182,15 @@ class EmbeddedReceiverServer:
             class Handler(BaseHTTPRequestHandler):
                 def log_message(self, format, *args):
                     pass # Quiet
+
+                def _drain(self, length: int) -> None:
+                    """Consume a rejected request body so the socket stays usable."""
+                    remaining = int(length or 0)
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
 
                 def _send_cors(self):
                     self.send_header("Access-Control-Allow-Origin", "*")
@@ -328,15 +399,54 @@ class EmbeddedReceiverServer:
                                 self.wfile.write(b'{"error":"Invalid range or payload"}')
                                 return
 
+                            # A deliberate hold/cancel from this device. The body
+                            # is drained first: the sender is still streaming, and
+                            # closing on it would surface as a broken pipe on
+                            # their side instead of the status code explaining
+                            # what actually happened. See docs/protocol.md.
+                            refusal = parent._refusal_marker_for(tid)
+                            if refusal:
+                                self._drain(length)
+                                code = 410 if refusal == "transfer_cancelled" else 409
+                                self.send_response(code)
+                                self.send_header("Content-Type", "application/json")
+                                self._send_cors()
+                                self.end_headers()
+                                self.wfile.write(json.dumps({
+                                    "detail": refusal,
+                                    "status": ("CANCELLED" if code == 410 else "PAUSED")
+                                }).encode())
+                                return
+
                             chunk_bytes = self.rfile.read(length)
-                            
+
                             # Write directly to destination at offset
                             dest_path = rec["file_path"]
-                            with open(dest_path, "r+b" if os.path.exists(dest_path) else "wb") as f:
-                                f.seek(start_byte)
-                                f.write(chunk_bytes)
-                                f.flush()
-                                os.fsync(f.fileno())
+                            try:
+                                with open(dest_path, "r+b" if os.path.exists(dest_path) else "wb") as f:
+                                    f.seek(start_byte)
+                                    f.write(chunk_bytes)
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                            except OSError as exc:
+                                # A cancel that lands mid-write removes the
+                                # partial underneath us. Answer the refusal so the
+                                # sender reports CANCELLED rather than a broken
+                                # connection; an unrelated IO failure is a real
+                                # 500 and keeps its own detail.
+                                was_cancelled = bool(rec.get("cancelled"))
+                                self.send_response(410 if was_cancelled else 500)
+                                self.send_header("Content-Type", "application/json")
+                                self._send_cors()
+                                self.end_headers()
+                                self.wfile.write(json.dumps({
+                                    "detail": "transfer_cancelled" if was_cancelled
+                                              else "chunk_write_failed",
+                                    "status": "CANCELLED" if was_cancelled else rec.get("status"),
+                                    "error": str(exc)
+                                }).encode())
+                                parent._notify_state(rec)
+                                return
 
                             new_received = max(rec["received_bytes"], start_byte + len(chunk_bytes))
                             rec["received_bytes"] = new_received
@@ -366,7 +476,18 @@ class EmbeddedReceiverServer:
                                 # atomic, and never raises into the request handler.
                                 record_server_history_entry(rec, self.client_address)
                             else:
-                                rec["status"] = "in_progress"
+                                # Same race as on the Android receiver: a chunk
+                                # accepted just before Pause arrives here and must
+                                # not put the session back into in_progress.
+                                if rec.get("cancelled"):
+                                    rec["status"] = "cancelled"
+                                elif rec.get("paused"):
+                                    rec["status"] = "paused"
+                                else:
+                                    rec["status"] = "in_progress"
+
+                            if rec.get("paused") or rec.get("cancelled"):
+                                rec["speed_bytes_sec"] = 0
 
                             parent._notify_state(rec)
 
@@ -382,6 +503,35 @@ class EmbeddedReceiverServer:
                                 "status": rec["status"],
                                 "calculated_sha256": calculated_sha,
                                 "sha256_verified": sha_verified
+                            }).encode())
+                            return
+
+                    # Session control from the sender: cancel a session it is
+                    # abandoning. Pause/resume are receiver-driven in the UI, but
+                    # both are exposed over HTTP as well so a script can hold a
+                    # transfer without touching the Hub.
+                    if path.startswith("/transfer/") and (
+                            path.endswith("/cancel") or path.endswith("/pause")
+                            or path.endswith("/resume")):
+                        parts = path.strip('/').split('/')
+                        if len(parts) == 3:
+                            tid = parts[1]
+                            verb = parts[2]
+                            action = {
+                                "cancel": parent.cancel_transfer,
+                                "pause": parent.pause_transfer,
+                                "resume": parent.resume_transfer,
+                            }[verb]
+                            ok = action(tid)
+                            self.send_response(200 if ok else 404)
+                            self.send_header("Content-Type", "application/json")
+                            self._send_cors()
+                            self.end_headers()
+                            self.wfile.write(json.dumps({
+                                "transfer_id": tid,
+                                "status": parent.transfers.get(tid, {}).get("status")
+                                          if ok else "unknown",
+                                "ok": ok
                             }).encode())
                             return
 

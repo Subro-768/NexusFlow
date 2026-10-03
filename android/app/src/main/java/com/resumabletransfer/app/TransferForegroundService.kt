@@ -9,7 +9,9 @@ import android.os.Build
 import android.os.PowerManager
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.resumabletransfer.app.ui.formatEta
 import kotlinx.coroutines.*
+import java.util.Locale
 
 /**
  * Keeps a transfer alive while the app is not in the foreground.
@@ -40,39 +42,59 @@ class TransferForegroundService : Service() {
         /** Safety ceiling so a leaked lock cannot drain the battery forever. */
         private const val WAKELOCK_TIMEOUT_MS = 6L * 60 * 60 * 1000
 
+        /** Stable PendingIntent request codes for the notification actions. */
+        private const val REQUEST_PAUSE = 11
+        private const val REQUEST_CANCEL = 12
+
         var transferManagerInstance: TransferManager? = null
     }
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
 
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
+        private var wakeLock: PowerManager.WakeLock? = null
+        private var wifiLock: WifiManager.WifiLock? = null
 
-    override fun onCreate() {
-        super.onCreate()
-        createNotificationChannel()
-    }
+        /**
+         * Whether startForeground() has already been answered for this service
+         * instance.
+         *
+         * Android gives a started foreground service about five seconds to call
+         * startForeground() and kills it otherwise. A notification action reaches
+         * the service through startService(), and a sticky restart delivers a null
+         * intent, so the foreground call cannot be tied to ACTION_START: it has to
+         * happen on the first onStartCommand whatever action arrives, and must not
+         * repeat on the ones after it (which would repost the generic
+         * "Transfer running" notification over the live one).
+         */
+        private var isForeground = false
 
-       override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // A sticky restart delivers a null intent: re-foreground so the
-        // notification and locks are restored without disturbing the transfer.
-        if (intent == null || intent.action == ACTION_START) {
-            startForegroundNow()
-            acquireLocks()
-            observeProgress()
+        override fun onCreate() {
+            super.onCreate()
+            createNotificationChannel()
         }
 
-        when (intent?.action) {
-            ACTION_PAUSE -> transferManagerInstance?.pauseTransfer()
-            ACTION_RESUME -> Unit
-            ACTION_CANCEL -> {
-                transferManagerInstance?.cancelTransfer()
-                finish()
+        override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+            if (!isForeground) {
+                startForegroundNow()
+                acquireLocks()
+                observeProgress()
             }
-        }
 
-        return START_STICKY
-    }
+            when (intent?.action) {
+                ACTION_PAUSE -> transferManagerInstance?.pauseTransfer()
+                // Resume is driven from here because the notification may be the
+                // only thing on screen: the service has no Activity to ask for the
+                // URI, name and size, so TransferManager reuses what it captured at
+                // startTransfer().
+                ACTION_RESUME -> transferManagerInstance?.resumeActiveTransfer()
+                ACTION_CANCEL -> {
+                    transferManagerInstance?.cancelTransfer()
+                    finish()
+                }
+            }
+
+            return START_STICKY
+        }
 
     private fun startForegroundNow() {
         val notification = buildNotification("Transfer running", 0, 0, 0L)
@@ -89,6 +111,7 @@ class TransferForegroundService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        isForeground = true
     }
 
     private fun acquireLocks() {
@@ -119,6 +142,7 @@ class TransferForegroundService : Service() {
 
     /** Leaves the foreground and drops the locks; used on every terminal state. */
     private fun finish() {
+        isForeground = false
         releaseLocks()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -146,7 +170,8 @@ class TransferForegroundService : Service() {
                                 transferredBytes = progress.transferredBytes,
                                 totalBytes = progress.totalBytes,
                                 speedBytes = progress.speedBytesPerSec,
-                                status = progress.status
+                                status = progress.status,
+                                etaSeconds = progress.etaSeconds
                             )
                        )
                     }
@@ -181,16 +206,35 @@ class TransferForegroundService : Service() {
         transferredBytes: Long = 0L,
         totalBytes: Long = 0L,
         speedBytes: Long = 0L,
-        status: TransferStatus = TransferStatus.TRANSFERRING
+        status: TransferStatus = TransferStatus.TRANSFERRING,
+        etaSeconds: Long = 0L
     ): Notification {
         val speedMb = speedBytes / (1024.0 * 1024.0)
         val transMb = transferredBytes / (1024.0 * 1024.0)
         val totMb = totalBytes / (1024.0 * 1024.0)
 
+        // Time left is only meaningful with a measured rate; showing "0s left"
+        // while the first chunk is still uploading is worse than showing none.
+        val etaSuffix = if (etaSeconds > 0 && speedBytes > 0) {
+            " · " + getString(R.string.notify_eta_suffix, formatEta(etaSeconds))
+        } else {
+            ""
+        }
+
         val statusText = when (status) {
-            TransferStatus.PAUSED -> "Paused - %.1f / %.1f MB".format(transMb, totMb)
-            TransferStatus.CONNECTING -> "Connecting..."
-            else -> "%.1f / %.1f MB (%.1f MB/s)".format(transMb, totMb, speedMb)
+            TransferStatus.PAUSED -> getString(
+                R.string.notify_paused_detail,
+                String.format(Locale.US, "%.1f", transMb),
+                String.format(Locale.US, "%.1f", totMb)
+            )
+            TransferStatus.CONNECTING -> getString(R.string.notify_connecting)
+            else -> String.format(
+                Locale.US,
+                "%.1f / %.1f MB (%.1f MB/s)",
+                transMb,
+                totMb,
+                speedMb
+            ) + etaSuffix
         }
 
         val pActivityIntent = PendingIntent.getActivity(
@@ -201,15 +245,53 @@ class TransferForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(if (filename.isNotEmpty()) filename else "File transfer")
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(if (filename.isNotEmpty()) filename else getString(R.string.notify_transfer_title))
             .setContentText(statusText)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
-            .setProgress(100, progressPercent, false)
+            .setOnlyAlertOnce(true)
+            .setProgress(100, progressPercent, status == TransferStatus.PAUSED)
             .setContentIntent(pActivityIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+
+        // Actions are what make the notification usable while the phone is in a
+        // pocket: the app may not even be in recents. Pause flips to Resume
+        // once the transfer is actually paused, and Cancel is always offered
+        // because a transfer nobody can stop is a transfer nobody can trust.
+        val paused = status == TransferStatus.PAUSED
+        builder.addAction(
+            if (paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
+            getString(if (paused) R.string.action_resume else R.string.action_pause),
+            actionPendingIntent(if (paused) ACTION_RESUME else ACTION_PAUSE, REQUEST_PAUSE)
+        )
+        builder.addAction(
+            android.R.drawable.ic_menu_close_clear_cancel,
+            getString(R.string.action_cancel),
+            actionPendingIntent(ACTION_CANCEL, REQUEST_CANCEL)
+        )
+
+        return builder.build()
+    }
+
+    /**
+     * A PendingIntent that re-enters this service with [action].
+     *
+     * Request codes are fixed per action, not per call: with
+     * FLAG_UPDATE_CURRENT a stable code means one PendingIntent per action,
+     * reused by every rebuild of the notification. A code derived from the
+     * action string alone would collide with the receive side's intents.
+     */
+    private fun actionPendingIntent(action: String, requestCode: Int): PendingIntent {
+        val intent = Intent(this, TransferForegroundService::class.java).apply {
+            this.action = action
+        }
+        return PendingIntent.getService(
+            this,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
     }
 
     private fun createNotificationChannel() {

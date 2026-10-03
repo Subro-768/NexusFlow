@@ -108,16 +108,45 @@ The protocol is built on HTTP/1.1 and JSON, with binary octet-stream chunk paylo
 }
 ```
 
+**Refused Chunk — receiver paused (409 Conflict):**
+
+A receiver can hold a transfer on purpose, from its own UI or from its
+notification. Nothing is written; the body of the chunk is drained first so the
+socket is left at a clean request boundary.
+
+```json
+{ "detail": "transfer_paused", "status": "PAUSED" }
+```
+
+**Refused Chunk — receiver cancelled (410 Gone):**
+
+```json
+{ "detail": "transfer_cancelled", "status": "CANCELLED" }
+```
+
+Senders must treat these two markers as decisions, not as transport failures:
+do not retry them, keep the session id so a later resume continues from
+`received_bytes`, and surface them as PAUSED / CANCELLED rather than as an
+error. Any other 4xx on a chunk is still a genuine failure and should be
+reported as one.
+
 ---
 
 ### 5. Cancel Session
 
 `POST /transfer/{transfer_id}/cancel`
 
+The receiver marks the session dead and deletes the partial file (the target is
+preallocated to the full size, so skipping this leaves a full-size file of
+zeros on disk).
+
 **Response (200 OK):**
 ```json
 {
   "transfer_id": "a9f8b2c1d3e4",
-  "status": "CANCELLED"
+  "status": "CANCELLED",
+  "received_bytes": 52428800
 }
 ```
+
+**Response (404 Not Found):** the session is unknown or already gone.

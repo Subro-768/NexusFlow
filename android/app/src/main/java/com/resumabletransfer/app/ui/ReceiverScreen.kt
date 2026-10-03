@@ -57,7 +57,10 @@ fun ReceiverScreen(
     onMenuClick: () -> Unit,
     onOpenDownloads: () -> Unit,
     deviceName: String = "",
-    onDeviceNameChange: (String) -> Unit = {}
+    onDeviceNameChange: (String) -> Unit = {},
+    onPauseIncoming: () -> Unit = {},
+    onResumeIncoming: () -> Unit = {},
+    onCancelIncoming: () -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -459,6 +462,111 @@ fun ReceiverScreen(
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace
                             )
+                        }
+
+                        // Time left, shown only once a rate has actually been
+                        // measured -- a countdown that reads "0s" for the first
+                        // second is noise, not information.
+                        if (incomingState.etaSeconds > 0 && incomingState.status != "PAUSED") {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Schedule,
+                                    contentDescription = null,
+                                    tint = SoloraSolarAmber,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    stringResource(
+                                        R.string.receiver_time_left,
+                                        formatEta(incomingState.etaSeconds)
+                                    ),
+                                    fontSize = 11.sp,
+                                    color = SoloraSolarAmber,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+
+                        // Pause / Resume / Cancel for the transfer that is
+                        // arriving right now.
+                        //
+                        // The Hub was read-only: once a push started, the only
+                        // way to stop it was to turn receiving off entirely,
+                        // which also dropped the session state. These act on
+                        // the live session, so the sender is told to hold
+                        // (HTTP 409) or that it is finished (410) instead of
+                        // stalling against a socket nobody is reading.
+                        val incomingPaused = incomingState.status == "PAUSED"
+                        val incomingLive = incomingState.status == "PENDING" ||
+                            incomingState.status == "IN_PROGRESS" ||
+                            incomingPaused
+                        if (incomingLive) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        if (incomingPaused) onResumeIncoming() else onPauseIncoming()
+                                    },
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, SoloraCyan),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = SoloraCyan),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                ) {
+                                    Icon(
+                                        if (incomingPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        stringResource(
+                                            if (incomingPaused) R.string.action_resume else R.string.action_pause
+                                        ),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 1.sp
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = onCancelIncoming,
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, SoloraAlertRed),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = SoloraAlertRed),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        stringResource(R.string.action_cancel),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 1.sp
+                                    )
+                                }
+                            }
+
+                            if (incomingPaused) {
+                                Text(
+                                    stringResource(R.string.receiver_paused_note),
+                                    fontSize = 10.sp,
+                                    color = SoloraTextMuted,
+                                    lineHeight = 15.sp
+                                )
+                            }
                         }
 
                         if (incomingState.status == "COMPLETED") {

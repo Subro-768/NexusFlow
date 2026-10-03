@@ -104,4 +104,32 @@
     <string name="msg_share_queue_cleared">Geteilte Dateien entfernt</string>
     <string name="msg_share_pick_device_first">Zuerst ein Empfängergerät auswählen</string>
     <string name="msg_share_queue_done">Alle geteilten Dateien gesendet</string>
+
+    <!-- Transfersteuerung: Benachrichtigungsaktionen und Empfänger-Hub -->
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Fortsetzen</string>
+    <string name="action_cancel">Abbrechen</string>
+
+    <!-- Benachrichtigung: ausgehende Übertragung -->
+    <string name="notify_transfer_title">Dateiübertragung</string>
+    <string name="notify_connecting">Verbindung wird hergestellt…</string>
+    <string name="notify_paused_detail">Pausiert — %1$s / %2$s MB</string>
+    <string name="notify_eta_suffix">noch %1$s</string>
+
+    <!-- Benachrichtigung: eingehende Übertragung -->
+    <string name="recv_channel_name">Eingehende Dateien</string>
+    <string name="recv_channel_description">Fortschritt für Dateien, die andere Geräte an dieses Telefon senden</string>
+    <string name="recv_notification_paused_detail">Pausiert — es wird nichts geschrieben</string>
+    <string name="recv_notification_done_verified">Empfangen und per SHA-256 geprüft</string>
+    <string name="recv_notification_done_unverified">Empfangen — Prüfsumme stimmt nicht</string>
+    <string name="recv_notification_cancelled">Empfang abgebrochen</string>
+    <string name="recv_notification_failed">Empfang fehlgeschlagen</string>
+    <string name="recv_notification_eta">noch %1$s</string>
+
+    <!-- Empfänger-Hub: laufende eingehende Übertragung -->
+    <string name="receiver_time_left">noch %1$s bei dieser Rate</string>
+    <string name="receiver_paused_note">Hält an der aktuellen Position. Das sendende Gerät wartet und setzt genau hier fort.</string>
+    <string name="msg_incoming_paused">Eingehende Übertragung pausiert</string>
+    <string name="msg_incoming_resumed">Eingehende Übertragung fortgesetzt</string>
+    <string name="msg_incoming_cancelled">Eingehende Übertragung abgebrochen — die Teildatei wurde gelöscht</string>
 </resources>

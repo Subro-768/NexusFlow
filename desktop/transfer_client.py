@@ -188,6 +188,26 @@ class LinuxTransferClient:
                     headers=headers,
                     timeout=self.timeout,
                 )
+
+                # A receiver may refuse a chunk on purpose. Both answers carry a
+                # marker in ``detail``; raise the same control-flow exceptions a
+                # local pause/cancel uses, so the GUI shows PAUSED / CANCELLED
+                # instead of a red network-failure badge for what is a deliberate
+                # decision made on the other device. Retrying either one is
+                # pointless.
+                detail = ''
+                if resp.status_code in (409, 410):
+                    try:
+                        detail = str(resp.json().get('detail', ''))
+                    except ValueError:
+                        detail = resp.text[:200]
+                if detail == 'transfer_paused':
+                    raise TransferPaused(
+                        'Receiving device paused this transfer; resume it there or here'
+                    )
+                if detail == 'transfer_cancelled':
+                    raise TransferCancelled('Receiving device cancelled this transfer')
+
                 resp.raise_for_status()
 
                 current_offset += len(chunk_data)
