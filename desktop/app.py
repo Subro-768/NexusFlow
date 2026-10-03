@@ -2379,6 +2379,11 @@ class ReceiverScreen(QWidget):
         desc = QVBoxLayout()
         desc.addWidget(QLabel(f"<b style='color:{SOLORA_CYAN};'>QUICK PAIRING:</b>"))
 
+        # The code sits under the QR because it is the manual equivalent of it:
+        # a peer whose camera is broken still has to authenticate, and hiding the
+        # credential behind a toggle would leave them no way in at all.
+        desc.addWidget(self.lbl_token)
+
         self.lbl_step2 = QLabel(f"2. On sender device, tap your device name: <b>{self._device_name}</b> (no IP needed).")
         self.lbl_step2.setStyleSheet(f"color: {SOLORA_TEXT_SECONDARY}; font-size: 9pt;")
         self.lbl_step2.setWordWrap(True)
@@ -2570,6 +2575,7 @@ class ReceiverScreen(QWidget):
             f"2. Tap your device name <b>{self._device_name}</b> on the sender device (auto-discovered)."
         )
         self.update_qr(self._pairing_code())
+        self._refresh_token_label()
         self.ip_updated_signal.emit(self.current_ip)
 
     def refresh_received_files(self):
@@ -2711,12 +2717,12 @@ class ReceiverScreen(QWidget):
         restarted between the screen being built and being used cannot hand out
         a token that no longer matches.
         """
-        token = self._receiver.auth_token if getattr(self, "_receiver", None) else ""
+        token = self.server.auth_token if getattr(self, "server", None) else ""
         return build_pairing_name(self._device_name, token=token)
 
     def _refresh_token_label(self) -> None:
         """Show the token so it can be typed instead of scanned."""
-        token = self._receiver.auth_token if getattr(self, "_receiver", None) else "--"
+        token = self.server.auth_token if getattr(self, "server", None) else "\u2014"
         self.lbl_token.setText(
             f"<b style='color:{SOLORA_AMBER};'>Pairing code:</b> "
             f"<b style='color:{SOLORA_AMBER};'>{token}</b>"

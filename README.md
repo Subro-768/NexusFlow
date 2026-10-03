@@ -10,10 +10,30 @@ Development: "Resumable File Transfer"**. A Linux desktop client ships in this
 repository as an extra peer for cross-platform testing.
 
 <p align="center">
-  <img src="docs/screenshots/android-sender-interrupted.png" width="30%" alt="Android sender after the app was killed mid-transfer" />
-  <img src="docs/screenshots/android-receiver-hub.png" width="30%" alt="Android receiver hub with a live incoming transfer" />
-  <img src="docs/screenshots/linux-hub-paused.png" width="30%" alt="Linux receiver hub, paused from the receiver side" />
+  <img src="docs/screenshots/android-sender-interrupted.png" width="32%" alt="Android sender after the app was killed mid-transfer" />
+  <img src="docs/screenshots/android-receiver-hub.png" width="32%" alt="Android receiver hub with a live incoming transfer" />
+  <img src="docs/screenshots/linux-receiver-paused.png" width="32%" alt="Linux receiver hub holding an incoming transfer" />
 </p>
+
+### The Linux client
+
+The desktop app is a full peer, not a stub: the same protocol, the same resume
+offsets, the same pause/resume/cancel controls.
+
+<p align="center">
+  <img src="docs/screenshots/linux-sender-ready.png" width="32%" alt="Linux sender with a file selected and the REMOVE control" />
+  <img src="docs/screenshots/linux-receiver-hub.png" width="32%" alt="Linux receiver hub showing the pairing code and QR" />
+  <img src="docs/screenshots/linux-receiver-live.png" width="32%" alt="Linux receiver with a 150 MB transfer arriving" />
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/linux-receiver-endpoint.png" width="49%" alt="Endpoint panel expanded, showing the address and port" />
+  <img src="docs/screenshots/linux-receiver-paused.png" width="49%" alt="Transfer held from the receiver side, with RESUME and CANCEL" />
+</p>
+
+Regenerate these with `python capture_screenshots.py` — it drives the real
+window through a real transfer and a real pause, so the screenshots cannot drift
+from the code the way hand-taken ones do.
 
 ---
 
