@@ -1462,6 +1462,15 @@ class SenderScreen(QWidget):
         self.btn_pick.setAccessibleName("Select file from disk")
         self.btn_pick.setToolTip("Choose a file to send (Ctrl+O) — or drag & drop it onto this window")
         self.btn_pick.clicked.connect(self.pick_file)
+        # Android has had a "NEW" control that clears the selection; the Linux
+        # sender had no equivalent, so once a file was chosen the only ways out
+        # were to start it or restart the app. Removed files and picking the
+        # wrong one are both routine, so it gets a real button.
+        self.btn_clear = QPushButton("✖  REMOVE"); self.btn_clear.setFixedHeight(46)
+        self.btn_clear.setEnabled(False)
+        self.btn_clear.setAccessibleName("Remove the selected file")
+        self.btn_clear.setToolTip("Clear the selected file without sending it (Esc)")
+        self.btn_clear.clicked.connect(self.clear_file)
         self.btn_start = QPushButton("▶  START TRANSFER"); self.btn_start.setFixedHeight(46)
         self.btn_start.setEnabled(False)
         # Item 4: a matching :hover/:disabled so the global
@@ -1476,10 +1485,31 @@ class SenderScreen(QWidget):
         self.btn_cancel = QPushButton("✖  CANCEL"); self.btn_cancel.setFixedHeight(46); self.btn_cancel.setEnabled(False)
         self.btn_cancel.setAccessibleName("Cancel transfer (Esc)")
         self.btn_cancel.clicked.connect(self.cancel_transfer)
-        br.addWidget(self.btn_pick, 2); br.addWidget(self.btn_start, 3)
+        br.addWidget(self.btn_pick, 2); br.addWidget(self.btn_clear, 1)
+        br.addWidget(self.btn_start, 3)
         br.addWidget(self.btn_pause, 1); br.addWidget(self.btn_cancel, 1)
         layout.addLayout(br)
         layout.addStretch()
+
+        # The tooltips have always advertised Ctrl+O and Esc, and neither was
+        # ever bound. Wiring them makes the promises true rather than deleting
+        # the hints: the shortcuts are what a file manager muscle-memory expects,
+        # and Esc doing the *right* thing depends on what is going on.
+        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.pick_file)
+        QShortcut(QKeySequence("Esc"), self, activated=self._escape_action)
+
+    def _escape_action(self):
+        """Esc: drop the file if nothing is running, otherwise stop the transfer.
+
+        One key for "back out of whatever I am looking at" -- but never the
+        destructive one by accident, and never cancelling work that has not
+        started.
+        """
+        running = self.active_worker is not None or self.active_transfer_id is not None
+        if running:
+            self.cancel_transfer()
+        elif self.selected_file:
+            self.clear_file()
 
     def _toggle_manual_entry(self):
         """Toggle visibility of manual IP entry section (item 22: direct ref)."""
@@ -1846,7 +1876,37 @@ class SenderScreen(QWidget):
         self.lbl_log.setText(f"Ready to transfer {os.path.basename(path)} ({format_size(sz)})")
         self.btn_start.setEnabled(True)
         self.btn_start.setText("▶  START TRANSFER")
+        self.btn_clear.setEnabled(True)
         self.prog_bar.setValue(0)
+
+    def clear_file(self):
+        """Put the file back to "NO FILE SELECTED" without sending it.
+
+        Mirrors Android's NEW button. A transfer already in flight is torn down
+        first, because leaving its worker writing to a file the card no longer
+        names is how the UI ends up describing a transfer it is not running.
+        """
+        if self.active_worker is not None or self.active_transfer_id is not None:
+            self._teardown_worker(cancel=True)
+
+        self.selected_file = None
+        self.active_file = None
+        self.active_transfer_id = None
+        self.active_client = None
+
+        self.lbl_file.setText("NO FILE SELECTED")
+        self.lbl_file.setToolTip("")
+        self.lbl_vol.setText("0 B / 0 B (0%)")
+        self.lbl_badge.setText("STANDBY")
+        self.lbl_badge.setStyleSheet(badge_qss(SOLORA_SURFACE_ELEVATED, SOLORA_TEXT_SECONDARY))
+        self.prog_bar.setValue(0)
+        self.lbl_log.setText("File removed. Nothing is selected.")
+
+        self.btn_start.setEnabled(False)
+        self.btn_start.setText("▶  START TRANSFER")
+        self.btn_clear.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
 
     def pick_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select File to Stream", os.path.expanduser("~"))
