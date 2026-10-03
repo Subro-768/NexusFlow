@@ -18,13 +18,63 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // ── Release signing ──────────────────────────────────────────────────────
+    // Credentials come from android/keystore.properties, which is gitignored.
+    // A keystore and its passwords do not belong in a public repository: anyone
+    // holding them can ship an update that Android accepts as this app. The
+    // release APK in app-release/ is signed; producing a new one needs your own
+    // key, which the README explains.
+    val keystorePropsFile = rootProject.file("keystore.properties")
+    // Parsed by hand rather than via java.util.Properties: inside a Gradle
+    // Kotlin script the bare name `java` resolves to Gradle's JavaPluginExtension
+    // and shadows the package, and the usual escape hatch does not compile here.
+    // The format is four flat key=value lines, so this is not a parser question.
+    val keystoreProps: Map<String, String> = if (keystorePropsFile.exists()) {
+        keystorePropsFile.readLines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") && "=" in it }
+            .associate { line ->
+                line.substringBefore('=').trim() to line.substringAfter('=').trim()
+            }
+    } else {
+        emptyMap()
+    }
+    val hasReleaseKey = keystoreProps["storeFile"]
+        ?.let { rootProject.file(it).exists() } == true
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getValue("storeFile"))
+                storePassword = keystoreProps["storePassword"]
+                keyAlias = keystoreProps["keyAlias"]
+                keyPassword = keystoreProps["keyPassword"]
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // Was false. A debug-signed APK with minification off is the largest,
+            // least private thing this project could ship -- and "debug" is in the
+            // filename a reviewer downloads.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = if (hasReleaseKey) {
+                signingConfigs.getByName("release")
+            } else {
+                // Warn rather than silently produce an unsigned APK that looks
+                // legitimate in a release folder.
+                logger.warn(
+                    "No keystore.properties found: assembleRelease will produce an " +
+                        "unsigned APK. The README explains how to create a key."
+                )
+                null
+            }
         }
     }
     compileOptions {

@@ -33,10 +33,16 @@ def fmt_bytes(n):
         n /= 1024
 
 
-def one_run(payload, digest):
-    """One transfer, timed, with a pause in the middle to measure the cost."""
+def one_run(payload, digest, tag):
+    """One transfer, timed.
+
+    Each run gets a private upload directory on purpose. Sharing one makes the
+    receiver treat an existing destination of the same size as an
+    already-received prefix -- which is exactly how resume works -- so runs two
+    and onwards would resume a finished file instead of transferring anything.
+    """
     receiver = EmbeddedReceiverServer(host="127.0.0.1", port=PORT,
-                                      upload_dir="/tmp/nexusflow_bench")
+                                      upload_dir=f"/tmp/nexusflow_bench_{tag}")
     assert receiver.start()
     time.sleep(0.3)
 
@@ -79,7 +85,7 @@ def pause_resume_cost(payload, digest):
     real path, not a convenient one, so it is the thing worth timing.
     """
     receiver = EmbeddedReceiverServer(host="127.0.0.1", port=PORT,
-                                      upload_dir="/tmp/nexusflow_bench")
+                                      upload_dir="/tmp/nexusflow_bench_pr")
     assert receiver.start()
     time.sleep(0.3)
     client = LinuxTransferClient(f"http://127.0.0.1:{PORT}", chunk_size=CHUNK,
@@ -106,13 +112,18 @@ def pause_resume_cost(payload, digest):
         pass
 
     detected = time.perf_counter() - holder["at"]
-    t_resume = time.perf_counter()
     receiver.resume_transfer(tid)
-    status = client.get_status(tid) if hasattr(client, "get_status") else None
-    client.send_file(payload, tid)
+
+    # Resume from the offset the receiver reports. Passing 0 here would re-send
+    # the whole file and quietly turn a resume measurement into a second full
+    # transfer -- which is how the first version of this script managed to
+    # report "held at 120 MB" for a hold that never happened.
+    offset = client.get_status(tid).get("received_bytes", 0)
+    client.send_file(payload, tid, start_offset=offset)
     total = time.perf_counter() - holder["at"]
     out = {
         "held_at_bytes": holder["bytes"],
+        "resumed_from": offset,
         "detect_ms": detected * 1000,
         "resume_to_finish_s": total,
     }
@@ -133,7 +144,7 @@ def main():
     rows = []
     for n in range(1, RUNS + 1):
         print(f"run {n}/{RUNS}...", flush=True)
-        r = one_run(payload, digest)
+        r = one_run(payload, digest, n)
         rows.append(r)
         print(f"  {fmt_bytes(SIZE)} in {r['elapsed']:.1f}s "
               f"= {r['throughput']/1e6:.2f} MB/s  "
@@ -143,8 +154,9 @@ def main():
     pr = pause_resume_cost(payload, digest)
     if pr:
         print(f"  held at {fmt_bytes(pr['held_at_bytes'])}; sender noticed in "
-              f"{pr['detect_ms']:.0f} ms; finished {pr['resume_to_finish_s']:.1f}s "
-              f"after the hold")
+              f"{pr['detect_ms']:.0f} ms")
+        print(f"  resumed from {fmt_bytes(pr['resumed_from'])} "
+              f"(not 0) and finished {pr['resume_to_finish_s']:.1f}s after the hold")
     os.unlink(payload)
     speeds = [r["throughput"] for r in rows]
     firsts = [r["first_chunk"] for r in rows if r["first_chunk"]]

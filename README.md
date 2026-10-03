@@ -35,6 +35,26 @@ Regenerate these with `python capture_screenshots.py` — it drives the real
 window through a real transfer and a real pause, so the screenshots cannot drift
 from the code the way hand-taken ones do.
 
+## Measured, not estimated
+
+`python benchmark.py` measures the real protocol over a real socket. The figures
+that matter for this project are the resume ones:
+
+| | |
+|---|---|
+| Hold detected by the sender | **4 ms** |
+| Resumed from | **42.0 MB — the receiver's offset, not 0** |
+| Time from hold to fully verified | **0.8 s** for a 120 MB file |
+| SHA-256 verified | 3/3 runs |
+| Android → Linux over a phone hotspot | **5.7–5.8 MB/s**, 220 MB file, resume verified |
+
+The loopback throughput the script also prints (~240 MB/s) is the protocol's
+ceiling with no radio in the path — useful for showing the overhead is not in
+the chunk loop, and **not** a phone-to-phone figure. The hotspot number above is
+the real one.
+
+
+
 ---
 
 ## Quick start
@@ -52,11 +72,30 @@ Prebuilt artifacts, so nothing has to be built to try it:
 
 | | |
 |---|---|
-| **`app-release/NexusFlow-debug.apk`** | The Android app. Debug-signed. |
+| **`app-release/NexusFlow-1.0-release.apk`** | The Android app, minified and release-signed. **Install this one.** |
+| `app-release/NexusFlow-debug.apk` | Unminified debug build, kept for comparison. |
 | **`app-release/NexusFlow-Linux-x86_64.tar.gz`** | The Linux client, a second endpoint of the same protocol. |
 
-> Debug-signed: `adb install -r -d app-release/NexusFlow-debug.apk`. No release
-> keystore is configured in this repository; see *Known limitations*.
+> Installing the release build needs a clean slate once, because its signature
+> differs from the debug build's: `adb uninstall com.resumabletransfer.app`
+> before the first `adb install`, then `-r -d` as normal afterwards.
+>
+> **The signing key is not in this repository, on purpose.** Anyone holding a
+> keystore and its passwords can ship an update that Android accepts as this
+> app, so committing one would be handing over the app. To produce your own
+> release build, generate a key and point the build at it — nothing else changes:
+>
+> ```bash
+> keytool -genkeypair -v -keystore android/keystore/my-release.jks \
+>   -storetype JKS -keyalg RSA -keysize 2048 -validity 10000 -alias mykey
+>
+> printf 'storeFile=keystore/my-release.jks\nstorePassword=...\nkeyAlias=mykey\nkeyPassword=...\n' \
+>   > android/keystore.properties
+>
+> cd android && ./gradlew assembleRelease
+> ```
+>
+> Both `keystore.properties` and `android/keystore/` are gitignored.
 
 **Send a file:** open the app, pick a device under *Nearby Devices*, select a
 file, press **START TRANSFER**.

@@ -12,3 +12,10 @@ android/local.properties
 *.db
 server/transfers.db
 android/.kotlin/
+
+# Release signing material. A committed keystore lets anyone who reads
+# the repository ship an update Android accepts as this app.
+android/keystore.properties
+android/keystore/
+*.jks
+*.keystore
