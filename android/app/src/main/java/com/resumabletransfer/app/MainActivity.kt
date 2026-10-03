@@ -94,6 +94,9 @@ class MainActivity : ComponentActivity() {
     private var discoveredPeers by mutableStateOf<List<PeerDevice>>(emptyList())
     private var isDiscovering by mutableStateOf(false)
 
+    /** Subnet-scan progress in percent, or -1 when not scanning. */
+    private var scanningProgress by mutableStateOf(-1)
+
     /** Name of the peer currently selected as target, for history grouping. */
     private var selectedPeerName by mutableStateOf("")
 
@@ -443,7 +446,7 @@ class MainActivity : ComponentActivity() {
                                         transferManager.setSavedServerPort(peer.port.toString())
                                         testConnection()
                                     },
-                                    onRefreshPeers = { startPeerDiscovery() },
+                                    onRefreshPeers = { rescanPeers() },
                                     onScanQr = { showPairingCodeDialog() },
                                     sharedFiles = sharedFiles,
                                     sharedQueueIndex = sharedQueueIndex,
@@ -480,6 +483,16 @@ class MainActivity : ComponentActivity() {
                                                 // screen -- peers resolve it over mDNS.
                                                 val name = deviceName.ifBlank { transferManager.getDeviceName() }
                                                 nsdHelper?.registerService(name, DEFAULT_PORT)
+                                                // Also announce over UDP broadcast. mDNS does
+                                                // NOT traverse an Android hotspot, so without
+                                                // this a laptop tethered to this phone could
+                                                // never discover it. Broadcast is the
+                                                // mechanism that works there.
+                                                LanDiscovery.startAdvertising(
+                                                    applicationContext,
+                                                    name,
+                                                    DEFAULT_PORT
+                                                )
                                                 notifyUser(getString(R.string.msg_receiver_started, name))
                                             } else {
                                                 notifyUser(getString(R.string.msg_receiver_start_failed))
@@ -487,6 +500,7 @@ class MainActivity : ComponentActivity() {
                                         } else {
                                             embeddedServer?.stop()
                                             nsdHelper?.unregisterService()
+                                            LanDiscovery.stopAdvertising()
                                             isReceiverRunning = false
                                             notifyUser(getString(R.string.msg_receiver_stopped))
                                         }
@@ -713,16 +727,72 @@ class MainActivity : ComponentActivity() {
         }
         isDiscovering = true
         helper.startDiscovery(ownIps)
+
+        // UDP broadcast scanning, in parallel with mDNS. Broadcast is what
+        // works on an Android hotspot (mDNS multicast is not forwarded), so it
+        // is started unconditionally rather than only when NSD succeeds.
+        // Results from both are merged so a peer visible either way appears.
+        LanDiscovery.onPeersChanged = { lanPeers ->
+            val fromLan = lanPeers.map {
+                PeerDevice(it.name, it.host, it.port)
+            }
+            lifecycleScope.launch {
+                val fromMdns = discoveredPeers
+                discoveredPeers = (fromMdns + fromLan)
+                    .distinctBy { "${it.name}|${it.host}|${it.port}" }
+                    .sortedBy { it.name }
+                if (discoveredPeers.isNotEmpty()) isDiscovering = false
+            }
+        }
+        LanDiscovery.startScanning(applicationContext)
+
         // NsdHelper.peers is a StateFlow, so collect() replays the current value.
         // When discovery stops (listener torn down) the empty list arrives here
         // and isDiscovering must be cleared -- previously it was only ever set
         // to true, so the panel said "Looking for devices..." indefinitely.
         lifecycleScope.launch {
             helper.peers.collect { peers ->
-                discoveredPeers = peers
+                val fromLan = LanDiscovery.getPeers().map {
+                    PeerDevice(it.name, it.host, it.port)
+                }
+                discoveredPeers = (peers + fromLan)
+                    .distinctBy { "${it.name}|${it.host}|${it.port}" }
+                    .sortedBy { it.name }
                 isDiscovering = false
             }
         }
+    }
+
+    /** Refresh button: query both discovery mechanisms immediately. */
+    private fun rescanPeers() {
+        LanDiscovery.scanNow()
+        nsdHelper?.startDiscovery(
+            embeddedServer?.getLocalIpAddresses() ?: listOf("127.0.0.1")
+        )
+        isDiscovering = true
+
+        // TCP subnet probe. On the target network neither multicast nor
+        // broadcast is relayed by the AP, but unicast is -- so asking each
+        // address directly is the only mechanism that finds anything. The local
+        // /24 resolves in under a second; the rest streams in behind it.
+        SubnetScanner.onFound = { peer ->
+            val device = PeerDevice(peer.deviceName, peer.ip, peer.port)
+            lifecycleScope.launch {
+                if (discoveredPeers.none { it.host == peer.ip }) {
+                    discoveredPeers = (discoveredPeers + device)
+                        .distinctBy { "${it.name}|${it.host}|${it.port}" }
+                        .sortedBy { it.name }
+                }
+                isDiscovering = false
+            }
+        }
+        SubnetScanner.onProgress = { pct ->
+            lifecycleScope.launch { scanningProgress = pct }
+        }
+        SubnetScanner.onDone = {
+            lifecycleScope.launch { scanningProgress = -1 }
+        }
+        SubnetScanner.start()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -966,6 +1036,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        LanDiscovery.stopScanning()
+        LanDiscovery.stopAdvertising()
+        SubnetScanner.stop()
         embeddedServer?.stop()
         nsdHelper?.destroy()
     }

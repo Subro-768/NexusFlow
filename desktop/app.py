@@ -54,6 +54,37 @@ except ImportError:
         ZEROCONF_AVAILABLE = False
         ZEROCONF_UNAVAILABLE_REASON = "mDNS discovery module could not be imported."
 
+# UDP broadcast discovery. Independent of zeroconf and the primary mechanism:
+# mDNS does not traverse an Android hotspot, broadcast does. See
+# lan_discovery.py for the full rationale.
+try:
+    from lan_discovery import lan
+except ImportError:
+    try:
+        from desktop.lan_discovery import lan
+    except ImportError:  # discovery degrades to a manual-IP fallback
+        lan = None
+
+try:
+    from nsd_helper import PeerInfo
+except ImportError:
+    try:
+        from desktop.nsd_helper import PeerInfo
+    except ImportError as _peer_err:  # pragma: no cover
+        # Discovery degrades to manual IP entry rather than failing to import.
+        PeerInfo = None
+
+# TCP subnet probe. On the measured target network neither multicast nor
+# broadcast crosses the AP, but unicast does -- so asking each address
+# directly is the only method that can work there.
+try:
+    from subnet_scan import scanner
+except ImportError:
+    try:
+        from desktop.subnet_scan import scanner
+    except ImportError:
+        scanner = None
+
 # Persistence layer: locked, cached, atomic (see desktop/storage.py).
 try:
     from storage import (
@@ -811,6 +842,25 @@ class WorkerBridge(QObject):
         self.peers_changed.emit(list(peers or []))
 
 
+def _make_peer(name: str, host: str, port: int):
+    """Build a peer record the nearby-devices panel can render.
+
+    Uses nsd_helper.PeerInfo when importable and falls back to a tiny local
+    object, so a missing dependency degrades discovery instead of the app.
+    """
+    if PeerInfo is not None:
+        return PeerInfo(name, host, port)
+
+    class _Peer:
+        def __init__(self, n, h, p):
+            self.name, self.host, self.port = n, h, p
+
+        def __repr__(self):
+            return f"PeerInfo(name={self.name!r}, host={self.host}, port={self.port})"
+
+    return _Peer(name, host, port)
+
+
 # ─── Sender Screen ────────────────────────────────────────────────────────────
 class DropZoneFrame(QFrame):
     """A frame that highlights itself while a file is dragged over it.
@@ -889,6 +939,13 @@ class SenderScreen(QWidget):
         self.bridge = bridge
         self.discovery_ok = False
         self.discovery_error = None
+        # UDP broadcast discovery has its own status; discovery_working is the
+        # union, so the UI never claims "unavailable" when broadcast is fine.
+        self.lan_ok = False
+        self.lan_error = None
+        self.discovery_working = False
+        # Peers located by the TCP subnet sweep, keyed "host:port".
+        self._scanned_peers: dict = {}
         self._peer_signature = None
         self._last_progress_emit = 0.0
         self._progress_min_interval = 1.0 / PROGRESS_THROTTLE_HZ
@@ -907,13 +964,36 @@ class SenderScreen(QWidget):
 
     # ── Discovery lifecycle ──────────────────────────────────────────────────
     def start_discovery(self):
-        """Start mDNS discovery, surfacing failure as a distinct UI state."""
+        """Start discovery over UDP broadcast and mDNS.
+
+        Broadcast is the primary mechanism because mDNS does not traverse an
+        Android hotspot: SoftAP does not forward multicast to clients, so two
+        devices on a phone hotspot could never see each other. Broadcast works
+        there. mDNS is still started because it is cheaper on a real LAN.
+        Both peer sets are merged in refresh_nearby_devices_ui().
+        """
+        own_ips = get_local_ips()
+
+        # UDP broadcast discovery (works on hotspots).
+        if lan is None:
+            self.lan_ok = False
+            self.lan_error = "Broadcast discovery module could not be imported."
+        else:
+            try:
+                lan.on_change = self._on_lan_peers
+                lan.start(own_ips=own_ips)
+                self.lan_ok = True
+                self.lan_error = None
+            except Exception as exc:
+                self.lan_ok = False
+                self.lan_error = f"{type(exc).__name__}: {exc}"
+
+        # mDNS discovery (best effort; may be unavailable).
         if nsd_discovery is None:
             self.discovery_ok = False
             self.discovery_error = "mDNS discovery module unavailable."
         else:
             try:
-                own_ips = get_local_ips()
                 on_change = self.bridge.on_peers_changed if self.bridge else None
                 self.discovery_ok = bool(nsd_discovery.start(own_ips=own_ips, on_change=on_change))
                 self.discovery_error = None if self.discovery_ok else (
@@ -922,8 +1002,104 @@ class SenderScreen(QWidget):
             except Exception as exc:
                 self.discovery_ok = False
                 self.discovery_error = f"{type(exc).__name__}: {exc}"
+
+        # Discovery is "working" if either mechanism came up.
+        self.discovery_working = self.lan_ok or self.discovery_ok
         self._peer_signature = None
         self.refresh_nearby_devices_ui()
+
+    def _on_lan_peers(self, peers):
+        """Called from the LAN discovery background thread.
+
+        Must not touch widgets: marshal the update onto the GUI thread via the
+        bridge's queued signal, exactly like the mDNS listener does.
+        """
+        if self.bridge is not None:
+            self.bridge.on_peers_changed(peers)
+        else:
+            QTimer.singleShot(0, self.refresh_nearby_devices_ui)
+
+    def refresh_peers_now(self):
+        """Refresh button: query broadcast, mDNS, and probe the subnet.
+
+        Broadcast and mDNS are attempted first because they are instant where they
+        work. The TCP subnet sweep then runs regardless: on a network whose AP
+        blocks client-to-client broadcast (which is the case on the target
+        hotspot/WiFi) it is the only mechanism that finds anything. The local
+        /24 is probed in well under a second; the rest of the /16 takes about
+        23s and reports devices as they appear.
+        """
+        try:
+            if lan is not None:
+                lan.scan_now()
+        except Exception as exc:
+            self.lan_error = f"{type(exc).__name__}: {exc}"
+        try:
+            if nsd_discovery is not None:
+                nsd_discovery.start(
+                    own_ips=get_local_ips(),
+                    on_change=self.bridge.on_peers_changed if self.bridge else None,
+                )
+        except Exception:
+            pass
+        self._peer_signature = None  # force a rebuild
+        self.refresh_nearby_devices_ui()
+        self.start_subnet_scan()
+
+    def start_subnet_scan(self):
+        """Probe the subnet for receivers, reporting progress and results."""
+        if scanner is None:
+            return
+        if scanner.scanning:
+            self.lbl_scanning.setText("● Scanning network...")
+            return
+
+        def on_found(ip, port, health):
+            # Called from a scan thread: marshal to the GUI thread.
+            name = self._display_name_for(ip, health)
+            QTimer.singleShot(0, lambda: self._add_scanned_peer(name, ip, port))
+
+        def on_progress(done, total):
+            pct = int(done * 100 / max(1, total))
+            QTimer.singleShot(0, lambda: self.lbl_scanning.setText(f"● Scanning network {pct}%"))
+
+        def on_done():
+            QTimer.singleShot(0, lambda: self.lbl_scanning.setText("● Scan complete"))
+
+        scanner.start(on_found=on_found, on_progress=on_progress, on_done=on_done)
+
+    @staticmethod
+    def _display_name_for(ip: str, health) -> str:
+        """Prefer a name the device advertises; fall back to its address."""
+        if health:
+            for key in ("device_name", "name", "hostname"):
+                value = health.get(key)
+                if value:
+                    return str(value)
+        return f"Device {ip}"
+
+    def _add_scanned_peer(self, name: str, host: str, port: int):
+        """Insert a scanned peer if it is not already listed."""
+        self._scanned_peers[f"{host}:{port}"] = _make_peer(name, host, port)
+        self._peer_signature = None  # force the panel to rebuild
+        self.refresh_nearby_devices_ui()
+
+    def stop_discovery(self):
+        try:
+            if lan is not None:
+                lan.stop()
+        except Exception:
+            pass
+        try:
+            if scanner is not None:
+                scanner.stop()
+        except Exception:
+            pass
+        try:
+            if nsd_discovery is not None:
+                nsd_discovery.stop()
+        except Exception:
+            pass
 
     def set_page_visible(self, visible: bool):
         """Item 13/26: stop the 2s poll when the Sender page is off-screen."""
@@ -932,6 +1108,36 @@ class SenderScreen(QWidget):
             self._discovery_timer.start(2000)
         else:
             self._discovery_timer.stop()
+
+    def _collect_peers(self) -> list:
+        """Merge peers from UDP broadcast and mDNS into one list.
+
+        Broadcast is what works on a hotspot, so it must not be gated on mDNS
+        succeeding -- the two sets are unioned and de-duplicated by
+        name@host:port, because a device visible on both would otherwise appear
+        twice.
+        """
+        merged: dict[str, object] = {}
+
+        try:
+            if lan is not None:
+                for p in lan.get_peers():
+                    merged[f"{p.name}@{p.host}:{p.port}"] = p
+        except Exception as exc:
+            print(f"[Sender] LAN peers unavailable: {type(exc).__name__}: {exc}")
+
+        try:
+            if nsd_discovery is not None:
+                for p in nsd_discovery.get_peers():
+                    merged.setdefault(f"{p.name}@{p.host}:{p.port}", p)
+        except Exception as exc:
+            print(f"[Sender] mDNS peers unavailable: {type(exc).__name__}: {exc}")
+
+        # Devices found by the TCP subnet sweep.
+        for p in self._scanned_peers.values():
+            merged.setdefault(f"{p.name}@{p.host}:{p.port}", p)
+
+        return list(merged.values())
 
     @staticmethod
     def _peer_hash(peers) -> str:
@@ -945,6 +1151,35 @@ class SenderScreen(QWidget):
         title = QLabel("SENDER MODE")
         title.setStyleSheet(f"color: {SOLORA_CYAN}; font-size: {FS_HEADING}; font-weight: bold; letter-spacing: 2px;")
         layout.addWidget(title)
+
+        # ── Refresh device list ──
+        # Prominent and labelled, not a bare glyph: rescanning is the thing a
+        # user reaches for when a peer does not appear, and the old 28px "⟳"
+        # next to the paste-code button was easy to miss.
+        btn_scan = QPushButton("⟳   RESCAN DEVICES")
+        btn_scan.setFixedHeight(34)
+        btn_scan.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_scan.setStyleSheet(
+            f"QPushButton {{ background-color: {SOLORA_SURFACE_ELEVATED};"
+            f" color: {SOLORA_CYAN}; border: 1px solid {SOLORA_CYAN};"
+            f" border-radius: 8px; font-weight: bold; font-size: {FS_META_SM}; }}"
+            # letter-spacing is deliberately omitted: Qt QSS rejects it on
+            # QPushButton ("Could not parse stylesheet"), it is only honoured on
+            # QLabel.
+            f"QPushButton:hover {{ background-color: {alpha(SOLORA_CYAN, 0.14)};"
+            f" color: {SOLORA_TEXT_PRIMARY}; border-color: {SOLORA_CYAN}; }}"
+            f"QPushButton:pressed {{ background-color: {alpha(SOLORA_CYAN, 0.24)}; }}"
+            f"QPushButton:focus {{ border-color: {SOLORA_NEON_LIME}; }}"
+            f"QPushButton:disabled {{ color: {SOLORA_TEXT_MUTED};"
+            f" border-color: {SOLORA_BORDER}; background-color: {SOLORA_SURFACE_ELEVATED}; }}"
+        )
+        btn_scan.setAccessibleName("Rescan for nearby devices")
+        btn_scan.setToolTip(
+            "Query over UDP broadcast and mDNS for devices that have receiving enabled"
+        )
+        btn_scan.clicked.connect(self.refresh_peers_now)
+        self.btn_scan = btn_scan
+        layout.addWidget(btn_scan)
 
         # Connection card
         cc = QFrame(); cc.setObjectName("card")
@@ -1018,9 +1253,11 @@ class SenderScreen(QWidget):
         nearby_title_row.addStretch()
         nearby_title_row.addWidget(self.lbl_scanning)
 
-        # Refresh nearby devices button
-        btn_refresh_nearby = QPushButton("⟳")
-        btn_refresh_nearby.setFixedSize(28, 28)
+        # Refresh nearby devices button. Text label rather than a "⟳" glyph:
+        # the dingbat and emoji fonts are not installed on this system, so the
+        # glyph buttons rendered as empty boxes.
+        btn_refresh_nearby = QPushButton("RESCAN")
+        btn_refresh_nearby.setFixedHeight(28)
         btn_refresh_nearby.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_refresh_nearby.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_CYAN}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: {FS_META_SM};")
         btn_refresh_nearby.setToolTip("Refresh nearby devices")
@@ -1033,8 +1270,8 @@ class SenderScreen(QWidget):
         # anywhere in the app. It now pastes a nexus:// / http:// pairing code,
         # which is the same information the receiver's QR encodes and which
         # parse_pairing_url() actually understands.
-        btn_qr_scan = QPushButton("🔗")
-        btn_qr_scan.setFixedSize(28, 28)
+        btn_qr_scan = QPushButton("PASTE CODE")
+        btn_qr_scan.setFixedHeight(28)
         btn_qr_scan.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_qr_scan.setStyleSheet(f"background: {SOLORA_SURFACE_ELEVATED}; color: {SOLORA_NEON_LIME}; border: 1px solid {SOLORA_BORDER}; border-radius: 6px; font-weight: bold; font-size: {FS_META_SM};")
         btn_qr_scan.setToolTip("Paste a pairing code from the receiver's QR screen")
@@ -1364,7 +1601,7 @@ class SenderScreen(QWidget):
         'discovery unavailable' case as its own state instead of an endless
         empty list.
         """
-        peers = nsd_discovery.get_peers() if nsd_discovery else []
+        peers = self._collect_peers()
         if self.bridge is None and _peers is not None:
             peers = _peers
 
@@ -1399,15 +1636,20 @@ class SenderScreen(QWidget):
             empty_layout.setContentsMargins(8, 8, 8, 8)
             empty_layout.setSpacing(6)
 
-            if not self.discovery_ok:
+            if not self.discovery_ok and not self.lan_ok:
                 lbl_none = QLabel("Device discovery unavailable")
                 lbl_none.setStyleSheet(f"color: {SOLORA_ALERT_RED}; font-size: {FS_SMALL}; font-weight: bold;")
                 lbl_none.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 lbl_none.setAccessibleName("Device discovery unavailable")
                 empty_layout.addWidget(lbl_none)
 
-                reason = self.discovery_error or ZEROCONF_UNAVAILABLE_REASON or "unknown error"
-                lbl_hint = QLabel(f"{reason}\nUse manual IP entry below, or install it and restart.")
+                reason = (
+                    self.lan_error or self.discovery_error
+                    or ZEROCONF_UNAVAILABLE_REASON or "unknown error"
+                )
+                lbl_hint = QLabel(
+                    f"{reason}\nBoth discovery methods failed. Use manual IP entry below."
+                )
                 lbl_hint.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: {FS_META_SM};")
                 lbl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 lbl_hint.setWordWrap(True)
@@ -2178,6 +2420,14 @@ class ReceiverScreen(QWidget):
                 self._device_name = name
                 if nsd_advertiser:
                     nsd_advertiser.start(device_name=name, port=8000)
+                # Also announce over UDP broadcast. mDNS does not traverse an
+                # Android hotspot, so without this the phone can never discover
+                # a laptop that is receiving while tethered to it.
+                if lan is not None:
+                    try:
+                        lan.advertise(device_name=name, service_port=8000)
+                    except Exception as exc:
+                        print(f"[LAN] advertise failed: {type(exc).__name__}: {exc}")
                 self.txt_device_name.setEnabled(False)
                 self.btn_toggle_server.setText("⏹  STOP RECEIVING")
                 self.btn_toggle_server.setStyleSheet(f"background-color: {SOLORA_ALERT_RED}; color: white; font-weight: bold; border-radius: 8px;")
@@ -2194,6 +2444,11 @@ class ReceiverScreen(QWidget):
             self.server.stop()
             if nsd_advertiser:
                 nsd_advertiser.stop()
+            if lan is not None:
+                try:
+                    lan.stop_advertise()
+                except Exception as exc:
+                    print(f"[LAN] stop_advertise failed: {type(exc).__name__}: {exc}")
             self.txt_device_name.setEnabled(True)
             self.btn_toggle_server.setText("⚡  ENABLE RECEIVING")
             self.btn_toggle_server.setStyleSheet(f"background-color: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; font-weight: bold; border-radius: 8px;")
@@ -2552,6 +2807,12 @@ class NexusFlowLinuxApp(QMainWindow):
         # holding a socket will otherwise outlive the window.
         if hasattr(self, "sender_screen"):
             sender = self.sender_screen
+            # Stop device discovery so the scan thread and its broadcast socket
+            # do not outlive the window.
+            try:
+                sender.stop_discovery()
+            except Exception as exc:
+                print(f"[warn] discovery teardown: {type(exc).__name__}: {exc}")
             # In-flight connection probe: interrupt its socket so the thread
             # returns promptly, then reap it. Without this, closing the window
             # during a ping destroys a running QThread (crash on exit).
