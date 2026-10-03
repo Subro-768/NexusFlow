@@ -135,6 +135,10 @@ class EmbeddedReceiverServer:
                 return False
             rec["paused"] = True
             rec["status"] = "paused"
+            # Stop reporting the rate of a transfer that is deliberately not
+            # moving. A frozen "2.78 MB/s" beside a PAUSED badge reads as a bug,
+            # and it would also seed a bogus ETA on resume.
+            rec["speed_bytes_sec"] = 0
         self._notify_state(rec)
         return True
 
@@ -307,7 +311,18 @@ class EmbeddedReceiverServer:
                                     "received_bytes": rec["received_bytes"],
                                     "total_size": rec["total_size"],
                                     "filesize": rec["total_size"],
-                                    "status": rec["status"]
+                                    "status": rec["status"],
+                                    # The sender reports its completion line from
+                                    # this payload, so the digest has to be here:
+                                    # without it every send ends in "verified=None"
+                                    # no matter what the receiver actually checked.
+                                    "calculated_sha256": rec.get("calculated_sha256"),
+                                    "expected_sha256": rec.get("expected_sha256"),
+                                    "sha256_verified": rec.get("sha256_verified"),
+                                    # `verified` is what LinuxTransferClient and the
+                                    # sender UI read; keep both spellings so either
+                                    # side of the pair can ask.
+                                    "verified": rec.get("sha256_verified")
                                 }).encode())
                                 return
                             else:

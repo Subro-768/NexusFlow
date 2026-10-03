@@ -320,6 +320,13 @@ def format_size(v):
     if v < 1024**3:   return f"{v/1024**2:.2f} MB"
     return f"{v/1024**3:.2f} GB"
 
+def format_eta(seconds):
+    """Seconds left, the same shape the sender screen and Android use."""
+    if seconds < 0:      return "--"
+    if seconds < 60:     return f"{seconds}s"
+    if seconds < 3600:   return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
 def get_local_ips():
     ips = []
     # 1. Probe network interfaces using 'ip route get' to find real default gateway interface
@@ -2266,11 +2273,46 @@ class ReceiverScreen(QWidget):
         
         self.lbl_rx_speed = QLabel("0 KB/s")
         self.lbl_rx_speed.setStyleSheet(f"color: {SOLORA_NEON_LIME}; font-weight: bold; font-family: monospace; font-size: 9.5pt;")
+
+        # Time left, hidden until a rate has actually been measured -- a
+        # countdown that reads 0s for the first second is noise, not information.
+        self.lbl_rx_eta = QLabel("")
+        self.lbl_rx_eta.setStyleSheet(f"color: {SOLORA_AMBER}; font-weight: bold; font-family: monospace; font-size: 9.5pt;")
+        self.lbl_rx_eta.setVisible(False)
         
         stats_row.addWidget(self.lbl_rx_vol)
+        stats_row.addWidget(self.lbl_rx_eta)
         stats_row.addStretch()
         stats_row.addWidget(self.lbl_rx_speed)
         pl.addLayout(stats_row)
+
+        # Pause / Resume / Cancel for the transfer arriving right now.
+        #
+        # The Hub was read-only: once a push started, the only way to stop it was
+        # to take the endpoint down, which also dropped the session. These act on
+        # the live session instead, so the sender is told to hold (HTTP 409) or
+        # that it is finished (410) rather than stalling against a socket nobody
+        # is reading. Same contract as the Android Hub.
+        self.rx_controls = QHBoxLayout()
+        self.rx_controls.setSpacing(8)
+
+        self.btn_rx_pause = QPushButton("⏸  PAUSE")
+        self.btn_rx_pause.setFixedHeight(34)
+        self.btn_rx_pause.setStyleSheet(f"color: {SOLORA_CYAN}; border: 1px solid {SOLORA_CYAN}; border-radius: 6px; padding: 4px 14px; font-weight: bold; font-size: 8.5pt;")
+        self.btn_rx_pause.clicked.connect(self.toggle_rx_pause)
+
+        self.btn_rx_cancel = QPushButton("✖  CANCEL")
+        self.btn_rx_cancel.setFixedHeight(34)
+        self.btn_rx_cancel.setStyleSheet(f"color: {SOLORA_ALERT_RED}; border: 1px solid {SOLORA_ALERT_RED}; border-radius: 6px; padding: 4px 14px; font-weight: bold; font-size: 8.5pt;")
+        self.btn_rx_cancel.clicked.connect(self.cancel_rx_transfer)
+
+        self.rx_controls.addWidget(self.btn_rx_pause)
+        self.rx_controls.addWidget(self.btn_rx_cancel)
+        self.rx_controls.addStretch()
+        self.rx_controls_widget = QWidget()
+        self.rx_controls_widget.setLayout(self.rx_controls)
+        self.rx_controls_widget.setVisible(False)
+        pl.addWidget(self.rx_controls_widget)
 
         self.lbl_payload_info = QLabel("Waiting for incoming connection stream...")
         self.lbl_payload_info.setStyleSheet(f"color: {SOLORA_TEXT_MUTED}; font-size: 8.5pt; font-family: monospace;")
@@ -2464,6 +2506,34 @@ class ReceiverScreen(QWidget):
             # Reset QR code pairing instruction
             self.lbl_step2.setText(f"2. On sender device, tap your device name: <b>{self._device_name}</b> (no IP needed).")
 
+    def _rx_active_id(self) -> str:
+        """transfer_id of the session the Hub controls should act on.
+
+        Read from the server rather than kept in a UI field: the state record
+        that drives the card is the authority, and a stale id here would pause a
+        session that had already finished.
+        """
+        for tid, rec in list(getattr(self.server, "transfers", {}).items()):
+            if rec.get("status") in ("pending", "in_progress", "paused"):
+                return tid
+        return ""
+
+    def toggle_rx_pause(self):
+        """Hold the incoming transfer, or let it continue if already held."""
+        tid = self._rx_active_id()
+        if not tid:
+            return
+        if self.server.transfers.get(tid, {}).get("status") == "paused":
+            self.server.resume_transfer(tid)
+        else:
+            self.server.pause_transfer(tid)
+
+    def cancel_rx_transfer(self):
+        """End the incoming transfer and remove the partial file."""
+        tid = self._rx_active_id()
+        if tid:
+            self.server.cancel_transfer(tid)
+
     def on_server_state_update(self, rec: dict):
         fname = rec.get("filename", "")
         recv = rec.get("received_bytes", 0)
@@ -2472,12 +2542,26 @@ class ReceiverScreen(QWidget):
         stat = rec.get("status", "pending")
         speed = rec.get("speed_bytes_sec", 0)
         sha = rec.get("calculated_sha256")
-        
+
         self.lbl_rx_filename.setText(fname if fname else "Incoming stream...")
         self.rx_prog_bar.setValue(pct)
         self.lbl_rx_vol.setText(f"{format_size(recv)} / {format_size(tot)} ({pct}%)")
-        self.lbl_rx_speed.setText(f"{format_size(int(speed))}/s" if stat != "completed" else "0 KB/s")
-        
+        self.lbl_rx_speed.setText(f"{format_size(int(speed))}/s" if stat in ("pending", "in_progress") else "0 KB/s")
+
+        # Time left from the measured rate. Held or finished transfers get none:
+        # a countdown frozen mid-transfer is worse than no countdown.
+        eta = (tot - recv) / speed if speed and speed > 0 and recv < tot else 0
+        if eta > 0 and stat == "in_progress":
+            self.lbl_rx_eta.setText(f"· {format_eta(int(eta))} left")
+            self.lbl_rx_eta.setVisible(True)
+        else:
+            self.lbl_rx_eta.setVisible(False)
+
+        # Controls exist only while a transfer is actually moving.
+        live = stat in ("pending", "in_progress", "paused")
+        self.rx_controls_widget.setVisible(live)
+        self.btn_rx_pause.setText("▶  RESUME" if stat == "paused" else "⏸  PAUSE")
+
         if stat == "completed":
             self.lbl_rx_status_badge.setText("COMPLETED")
             self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_ENERGY_GREEN}; color: {SOLORA_BG}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
@@ -2485,6 +2569,18 @@ class ReceiverScreen(QWidget):
             if sha:
                 msg += f"  ·  SHA-256: {sha[:16]}..."
             self.lbl_payload_info.setText(msg)
+            self.refresh_received_files()
+        elif stat == "paused":
+            self.lbl_rx_status_badge.setText("PAUSED")
+            self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_AMBER}; color: {SOLORA_BG}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+            self.lbl_payload_info.setText(
+                f"Holding at {format_size(recv)} / {format_size(tot)} ({pct}%). "
+                "The sending device waits and picks up exactly here."
+            )
+        elif stat == "cancelled":
+            self.lbl_rx_status_badge.setText("CANCELLED")
+            self.lbl_rx_status_badge.setStyleSheet(f"background: {SOLORA_ALERT_RED}; color: {SOLORA_BG}; font-size: 8pt; font-weight: bold; padding: 3px 8px; border-radius: 6px;")
+            self.lbl_payload_info.setText(f"Cancelled at {pct}% — the partial file was deleted.")
             self.refresh_received_files()
         elif stat == "in_progress":
             self.lbl_rx_status_badge.setText("RECEIVING")
@@ -2710,9 +2806,17 @@ class NexusFlowLinuxApp(QMainWindow):
         right_layout.addWidget(topbar)
 
         # Pages
+        #
+        # Both screens get the thread bridge. Without it, ReceiverScreen falls
+        # back to calling its state handler straight from the http.server request
+        # thread, so every chunk updated QLabels -- and every completed transfer
+        # rebuilt the Received Files list -- off the GUI thread, which Qt answers
+        # with "QObject::setParent: Cannot set parent, new parent is in a
+        # different thread". The bridge turns that into a queued signal.
+        self.bridge = WorkerBridge()
         self.stack = QStackedWidget()
-        self.sender_screen   = SenderScreen()
-        self.receiver_screen = ReceiverScreen()
+        self.sender_screen   = SenderScreen(bridge=self.bridge)
+        self.receiver_screen = ReceiverScreen(bridge=self.bridge)
         self.history_screen  = HistoryScreen()
         self.settings_screen = SettingsScreen()
         self.stack.addWidget(self.sender_screen)
