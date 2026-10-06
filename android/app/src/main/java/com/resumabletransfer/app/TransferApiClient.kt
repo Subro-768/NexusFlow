@@ -19,8 +19,43 @@ class TransferApiClient(
      * remember — a per-chunk post that forgot it would fail mid-transfer and
      * surface as an unexplained connection error.
      */
-    private val token: String = ""
+    private val token: String = "",
+    /**
+     * Called once when the receiver answers 401, so the caller can drop the
+     * now-dead credential instead of retrying it forever.
+     *
+     * Attached at construction rather than handled per call site: the token is
+     * minted per receiver process, so staleness is the *expected* cause of a 401,
+     * not an edge case. Keeping the token after it has been refused guarantees
+     * the next attempt fails identically with no way to tell why.
+     */
+    private val onUnauthorized: (() -> Unit)? = null
 ) {
+
+    /**
+     * A request the receiver refused because the pairing token was missing or stale.
+     *
+     * The receiver answers `401` for three different situations that look identical
+     * from the wire:
+     *
+     *  * no token was ever stored for this host,
+     *  * a token was stored but the receiver has since restarted and regenerated
+     *    its own, or
+     *  * the token is simply wrong.
+     *
+     * All three used to arrive as a plain `IOException("... HTTP 401")`, which the
+     * UI could only report as a generic failure. That matters because the second
+     * case is the common one: the receiver mints a fresh token on every start (see
+     * `generateToken` on both sides), so any receiver restart silently invalidates
+     * every token already saved. Retrying the dead credential can never succeed --
+     * the only fix is to pair again with the code on the receiver's screen.
+     *
+     * This type makes the case actionable instead of terminal-looking.
+     */
+    class UnauthorizedException(
+        val statusCode: Int = 401,
+        message: String = "Receiver rejected the pairing token."
+    ) : IOException(message)
 
     companion object {
         /**
@@ -54,6 +89,31 @@ class TransferApiClient(
             }
         }
         .build()
+
+    /**
+     * Turn a non-2xx response into the right failure type.
+     *
+     * Centralised so a 401 can never again be reported as a generic IO problem:
+     * every call site previously built its own `IOException("... HTTP 401")` from
+     * a slightly different message, which meant nothing upstream could recognise
+     * the one failure whose remedy is "pair again", not "retry".
+     */
+    private fun httpFailure(prefix: String, code: Int, message: String = ""): IOException {
+        if (code == 401) {
+            // The credential is now known-bad: let the caller drop it so the next
+            // attempt starts from the truth ("not paired") rather than repeating
+            // a request that cannot succeed.
+            onUnauthorized?.invoke()
+            return UnauthorizedException(
+                message = "Receiver refused the request (HTTP 401). " +
+                    "The pairing code is missing, wrong, or out of date -- if the " +
+                    "receiver was restarted it now has a new code. Tap the keyboard " +
+                    "icon in NEARBY DEVICES and enter the code shown on the receiver."
+            )
+        }
+        val suffix = if (message.isBlank()) "" else " $message"
+        return IOException("$prefix: HTTP $code$suffix")
+    }
 
     fun cancelAllRequests() {
         client.dispatcher.cancelAll()
@@ -94,7 +154,7 @@ class TransferApiClient(
         return try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    return Result.failure(IOException("Server returned HTTP ${response.code}"))
+                    return Result.failure(httpFailure("Server returned", response.code))
                 }
                 val body = response.body?.string() ?: ""
                 val json = JSONObject(body)
@@ -148,7 +208,7 @@ class TransferApiClient(
         return try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    return Result.failure(IOException("Failed to create transfer: HTTP ${response.code} ${response.message}"))
+                    return Result.failure(httpFailure("Failed to create transfer", response.code, response.message))
                 }
                 val body = response.body?.string() ?: ""
                 val resJson = JSONObject(body)
@@ -182,7 +242,7 @@ class TransferApiClient(
                     return Result.failure(NoSuchElementException("Transfer session $transferId expired or not found"))
                 }
                 if (!response.isSuccessful) {
-                    return Result.failure(IOException("Failed to query transfer status: HTTP ${response.code}"))
+                    return Result.failure(httpFailure("Failed to query transfer status", response.code))
                 }
                 val body = response.body?.string() ?: ""
                 val resJson = JSONObject(body)
@@ -213,7 +273,7 @@ class TransferApiClient(
         return try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    return Result.failure(IOException("Failed to fetch history: HTTP ${response.code}"))
+                    return Result.failure(httpFailure("Failed to fetch history", response.code))
                 }
                 val body = response.body?.string() ?: "[]"
                 val jsonArray = JSONArray(body)
@@ -262,7 +322,10 @@ class TransferApiClient(
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val errorBody = response.body?.string() ?: ""
-                    return Result.failure(IOException("Chunk rejected: HTTP ${response.code} - $errorBody"))
+                    if (response.code == 401) {
+                return Result.failure(httpFailure("Chunk rejected", 401, errorBody))
+            }
+            return Result.failure(IOException("Chunk rejected: HTTP ${response.code} - $errorBody"))
                 }
                 val respBody = response.body?.string() ?: ""
                 val resJson = JSONObject(respBody)

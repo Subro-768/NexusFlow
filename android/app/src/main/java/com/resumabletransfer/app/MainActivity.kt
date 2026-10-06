@@ -663,6 +663,11 @@ class MainActivity : ComponentActivity() {
                                     onRefreshPeers = { rescanPeers() },
                                     onScanQr = { launchQrScanner() },
                                     onManualPairingEntry = { showPairingCodeDialog() },
+                                    // A peer is only "paired" when a token is actually stored
+                                    // for it. Selection is not authentication, and showing a
+                                    // tick for a merely-selected peer made an unauthenticated
+                                    // receiver look ready to use.
+                                    isPaired = { host -> transferManager.hasPeerToken(host) },
                                     sharedFiles = sharedFiles,
                                     sharedQueueIndex = sharedQueueIndex,
                                     onRemoveShared = { removeSharedFile(it) },

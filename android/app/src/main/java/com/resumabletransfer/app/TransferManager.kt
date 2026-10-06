@@ -422,7 +422,11 @@ class TransferManager private constructor(private val context: Context) {
         activeSpec = ActiveSpec(serverUrl, uri, filename, fileSize, peerDisplayName)
 
         transferJob = coroutineScope.launch {
-            val client = TransferApiClient(serverUrl, token = token)
+            val client = TransferApiClient(
+                serverUrl,
+                token = token,
+                onUnauthorized = { forgetPeerToken(currentPeerHost ?: serverUrl) }
+            )
             activeApiClient = client
 
             try {
@@ -946,6 +950,24 @@ class TransferManager private constructor(private val context: Context) {
 
     fun tokenForHost(host: String): String =
         prefs.getString(KEY_PEER_TOKEN_PREFIX + host.trim(), "").orEmpty()
+
+    /**
+     * Forget a receiver's token because it was refused.
+     *
+     * A receiver mints a fresh token every time it starts, so a saved token goes
+     * stale silently: the 401 looks exactly like "never paired", and without
+     * dropping the dead value every later request keeps presenting it and keeps
+     * being refused. Clearing it makes the next attempt fail with *no* token --
+     * which is the honest state, and the one the UI can explain.
+     */
+    fun forgetPeerToken(host: String) {
+        val clean = host.trim()
+        if (clean.isEmpty()) return
+        prefs.edit().remove(KEY_PEER_TOKEN_PREFIX + clean).apply()
+    }
+
+    /** Whether a token is stored for this host, for showing pairing state on a chip. */
+    fun hasPeerToken(host: String): Boolean = tokenForHost(host).isNotBlank()
 
     fun cancelTransfer() {
         isCancelled = true

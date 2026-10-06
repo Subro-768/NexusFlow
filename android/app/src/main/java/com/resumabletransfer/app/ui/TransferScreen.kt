@@ -121,6 +121,8 @@ fun TransferScreen(
     onScanQr: () -> Unit = {},
     onManualPairingEntry: () -> Unit = {},
     isDiscovering: Boolean = false,
+    /** Whether a pairing token is stored for a host, so a peer chip can say so. */
+    isPaired: (String) -> Boolean = { false },
     sharedFiles: List<SharedFile> = emptyList(),
     sharedQueueIndex: Int = 0,
     onRemoveShared: (SharedFile) -> Unit = {},
@@ -191,7 +193,8 @@ fun TransferScreen(
                 onSelectPeer = onSelectPeer,
                 onRefreshPeers = onRefreshPeers,
                 onScanQr = onScanQr,
-                onManualPairingEntry = onManualPairingEntry
+                onManualPairingEntry = onManualPairingEntry,
+            isPaired = isPaired
             )
 
             ErrorBanner(progress.errorMessage, progress.status)
@@ -983,7 +986,8 @@ private fun PeerDiscoveryPanel(
     onSelectPeer: (PeerDevice) -> Unit,
     onRefreshPeers: () -> Unit,
     onScanQr: () -> Unit,
-    onManualPairingEntry: () -> Unit
+    onManualPairingEntry: () -> Unit,
+    isPaired: (String) -> Boolean
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -1075,6 +1079,16 @@ private fun PeerDiscoveryPanel(
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(discoveredPeers, key = { "${it.host}:${it.port}" }) { peer ->
                         val isSelected = peer.host == selectedHost
+                        // Selection and authentication are different facts, and
+                        // conflating them is actively misleading: a green tick on
+                        // a peer only ever meant "this is the target", so a device
+                        // that has never been paired looked authenticated and the
+                        // 401 that followed looked like a network fault.
+                        //
+                        // The tick is therefore only shown when a token is actually
+                        // stored for this peer; selection on its own gets a target
+                        // icon and a "needs pairing" hint.
+                        val isPaired = isPaired(peer.host)
                         val selectDesc = stringResource(
                             if (isSelected) R.string.peer_selected else R.string.peer_unselected
                         )
@@ -1085,12 +1099,12 @@ private fun PeerDiscoveryPanel(
                                 .heightIn(min = MinTouchTarget),
                             shape = RoundedCornerShape(10.dp),
                             colors = ButtonDefaults.outlinedButtonColors(
-                                containerColor = if (isSelected) {
+                                containerColor = if (isSelected && isPaired) {
                                     SoloraEnergyGreen.copy(alpha = 0.15f)
                                 } else {
                                     MaterialTheme.colorScheme.surface
                                 },
-                                contentColor = if (isSelected) SoloraEnergyGreen else SoloraTextPrimary
+                                contentColor = if (isSelected && isPaired) SoloraEnergyGreen else SoloraTextPrimary
                             )
                         ) {
                             Row(
@@ -1099,10 +1113,13 @@ private fun PeerDiscoveryPanel(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Icon(
-                                    if (isSelected) Icons.Default.CheckCircle
-                                    else Icons.Default.PhoneAndroid,
-                                    contentDescription = null,
-                                    tint = if (isSelected) SoloraEnergyGreen else SoloraCyan,
+                                    when {
+                                        isSelected && isPaired -> Icons.Default.CheckCircle
+                                        isSelected -> Icons.Default.PhoneAndroid
+                                        else -> Icons.Default.PhoneAndroid
+                                    },
+                                    contentDescription = selectDesc,
+                                    tint = if (isSelected && isPaired) SoloraEnergyGreen else SoloraCyan,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(Modifier.width(6.dp))
