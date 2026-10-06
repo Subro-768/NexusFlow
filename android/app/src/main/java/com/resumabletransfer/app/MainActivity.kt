@@ -36,6 +36,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.resumabletransfer.app.server.EmbeddedTransferServer
+import com.resumabletransfer.app.ui.PairingCode
 import com.resumabletransfer.app.ui.PairingCodeDialog
 import com.resumabletransfer.app.ui.ReceiverScreen
 import com.resumabletransfer.app.ui.ResumableTransferTheme
@@ -284,14 +285,17 @@ class MainActivity : ComponentActivity() {
                 host = hostPart.takeIf { it.isNotBlank() }
                 port = portPart.toIntOrNull() ?: DEFAULT_PORT
             }
-            uri.startsWith("http://") || uri.startsWith("https://") -> {
-                val withoutScheme = uri.substringAfter("://")
-                host = withoutScheme.substringBefore('/').substringBefore(':').takeIf { it.isNotBlank() }
-                port = withoutScheme.substringAfter(':', "").substringBefore('/').toIntOrNull() ?: DEFAULT_PORT
-            }
             else -> {
-                host = null
-                port = null
+                // A bare `host:port`, optionally with `?t=`. This is the form a
+                // person actually types when reading the token off the other
+                // screen, and the validator has always accepted it -- but there
+                // was no branch for it here, so it fell through to host = null
+                // and was then rejected as "unrecognised". PairingCode.parse
+                // handles every form the dialog accepts, including the two
+                // scheme forms above.
+                val parsed = PairingCode.parse(uri)
+                host = parsed?.host
+                port = parsed?.port
             }
         }
         if (host == null) {
@@ -302,7 +306,10 @@ class MainActivity : ComponentActivity() {
         if (port != null) serverPort = port.toString()
         transferManager.setSavedServerIp(serverIp)
         transferManager.setSavedServerPort(serverPort)
-        pendingPairToken?.let { transferManager.rememberPeerToken(serverIp, it) }
+        // Prefer the token this parse found; fall back to the one read before
+        // the form was interpreted, which is what the QR path relies on.
+        val token = PairingCode.tokenFrom(uri)?.takeIf { it.isNotBlank() } ?: pendingPairToken
+        if (!token.isNullOrBlank()) transferManager.rememberPeerToken(serverIp, token)
         notifyUser(getString(R.string.msg_pairing_connected, serverIp, serverPort))
         testConnection()
     }

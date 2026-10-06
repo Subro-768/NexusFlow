@@ -81,7 +81,7 @@ fun PairingCodeDialog(
                     value = code,
                     onValueChange = { code = it },
                     singleLine = true,
-                    isError = code.isNotBlank() && !isPlausiblePairingCode(code),
+                    isError = code.isNotBlank() && !PairingCode.isPlausible(code),
                     placeholder = {
                         Text(
                             "nexus://192.168.1.5:8000",
@@ -110,7 +110,7 @@ fun PairingCodeDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                if (code.isNotBlank() && !isPlausiblePairingCode(code)) {
+                if (code.isNotBlank() && !PairingCode.isPlausible(code)) {
                     Text(
                         text = stringResource(R.string.pairing_dialog_bad_code),
                         fontSize = 11.sp,
@@ -132,7 +132,7 @@ fun PairingCodeDialog(
                     }
                     Button(
                         onClick = { onSubmit(code.trim()) },
-                        enabled = code.isNotBlank() && isPlausiblePairingCode(code),
+                        enabled = code.isNotBlank() && PairingCode.isPlausible(code),
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = SoloraCyan,
@@ -155,21 +155,112 @@ fun PairingCodeDialog(
 }
 
 /**
- * Cheap shape check, so OK is disabled on obvious rubbish instead of failing
- * after the dialog closes.
+ * Every pairing-code form this app accepts, in one place.
  *
- * Deliberately permissive: `nexus://receive/<name>` has no port, a bare
- * `host:port` is accepted, and an `http://` URL is accepted. This is a typo
- * guard, not a parser -- the real parsing lives in applyPairingUri and must
- * never reject something it can actually handle.
+ * There are three of them, and they differ only in their prefix:
+ *
+ *   nexus://host:port[?t=TOKEN]   what the desktop Receiver screen puts in its QR
+ *   http://host:port[?t=TOKEN]    a URL copied out of a browser bar
+ *   host:port[?t=TOKEN]           what someone actually types
+ *
+ * The optional `?t=` carries the receiver's pairing token, so a device with no
+ * working camera can still authenticate: read the 8 characters off the
+ * receiver's screen, type them here, and the transfer is authorised.
+ *
+ * ## Why this exists
+ *
+ * The validator that used to live here and the parser in `MainActivity` had
+ * drifted apart, and they disagreed on the most important case:
+ *
+ *  * the validator allowed a bare `host:port` but not a `?t=` suffix, so a
+ *    hand-typed token was rejected as "does not look like a pairing code" --
+ *    while the desktop side has always accepted exactly that form, and
+ *    `applyPairingUri` reads `?t=` from any form;
+ *  * the validator allowed bare `host:port`, but `applyPairingUri` had no branch
+ *    for it and fell through to `host = null`, so the dialog accepted it and
+ *    the app then refused it with "unrecognised".
+ *
+ * Both bugs were found the same way: typing a code by hand on a device whose
+ * camera could not be used, on a network where discovery does not work.
+ *
+ * Parsing now happens once, here, and `applyPairingUri` uses these results
+ * directly. A form that validates is a form that parses, so the two cannot
+ * disagree again.
  */
-internal fun isPlausiblePairingCode(code: String): Boolean {
-    val trimmed = code.trim()
-    if (trimmed.isEmpty()) return false
-    // No spaces anywhere: every accepted form is a single URI or host:port.
-    if (trimmed.any { it.isWhitespace() }) return false
-    return trimmed.startsWith("nexus://") ||
-        trimmed.startsWith("http://") ||
-        trimmed.startsWith("https://") ||
-        trimmed.matches(Regex("^[\\w.-]+(:\\d{1,5})?$"))
+internal object PairingCode {
+
+    private val SCHEMES = listOf("nexus://", "http://", "https://")
+
+    data class Target(val host: String, val port: Int?, val token: String?)
+
+    /**
+     * Parse a typed or pasted pairing code.
+     *
+     * Returns null for anything unrecognisable, which is what the dialog turns
+     * into "that does not look like a pairing code" and what the QR path turns
+     * into "unrecognised".
+     */
+    fun parse(code: String): Target? {
+        val trimmed = code.trim()
+        if (trimmed.isEmpty()) return null
+        // No spaces anywhere: every accepted form is a single URI or host:port.
+        if (trimmed.any { it.isWhitespace() }) return null
+
+        val scheme = SCHEMES.firstOrNull { trimmed.startsWith(it) }
+        // Everything after the scheme. Only the `//` that belongs to the
+        // scheme is removed: a code like `nexus:///path` has no host at all and
+        // must be rejected rather than turning "path" into one.
+        val rest = if (scheme != null) {
+            trimmed.removePrefix(scheme).removePrefix("//")
+        } else {
+            trimmed
+        }
+        // The query is optional, and only `t=` matters; a name-only code
+        // (`nexus://receive/DESKTOP`) is handled by the caller, not here.
+        val authority = rest.substringBefore('?').trimEnd('/')
+        val query = rest.substringAfter('?', "")
+        if (authority.isEmpty()) return null
+
+        // The path, if any, is not part of the address and is dropped: these
+        // codes are host:port plus a token, never a URL with a resource. Split
+        // it off before looking for a port, or `host:8000/path` would make the
+        // port unparseable.
+        val withoutPath = authority.substringBefore('/')
+        val host = withoutPath.substringBefore(':').takeIf { it.isNotBlank() } ?: return null
+        val portPart = withoutPath.substringAfter(':', "")
+        val port = portPart.takeIf { it.isNotEmpty() }?.toIntOrNull()
+
+        // A port that is present but not a number is a typo, not a default -- and a
+        // number outside the legal range is a typo too, not something to clamp.
+        if (portPart.isNotEmpty() && (port == null || port !in 1..65535)) return null
+
+        return Target(host, port, query.tokenOrNull())
+    }
+
+    /** Cheap shape check, so OK is disabled on obvious rubbish. */
+    fun isPlausible(code: String): Boolean = parse(code) != null
+
+    /**
+     * Pull `?t=` out of a pairing payload.
+     *
+     * Kept for the QR path, which must not fail on a payload this app happens
+     * to be unable to parse: an unparseable code still needs to be searched for
+     * by name rather than silently rejected.
+     */
+    fun tokenFrom(uri: String): String? {
+        val query = uri.substringAfter('?', "")
+        if (query.isEmpty()) return null
+        return query.split("&")
+            .firstOrNull { it.startsWith("t=") }
+            ?.substringAfter("t=")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun String.tokenOrNull(): String? =
+        split("&")
+            .firstOrNull { it.startsWith("t=") }
+            ?.substringAfter("t=")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
 }
