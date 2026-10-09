@@ -451,6 +451,10 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
         if (record.status == "COMPLETED") {
             val calcHash = calculateFileSha256(record.targetFile)
             record.calculatedSha256 = calcHash
+            // A mismatch fails the record itself, not just the local `verified`
+            // flag, so everything downstream -- the history written below,
+            // /transfers, the Receiver Hub -- sees FAILED rather than COMPLETED
+            // for a file whose digest did not match.
             if (record.expectedSha256 != null && !record.expectedSha256.equals(calcHash, ignoreCase = true)) {
                 record.status = "FAILED"
                 verified = false
@@ -629,7 +633,21 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
             speedBytesPerSec = if (record.paused) 0L else speedCalculator.currentSpeed(),
             etaSeconds = etaSeconds,
             calculatedSha256 = record.calculatedSha256,
-            sha256Verified = record.status == "COMPLETED",
+            // Derived from the digests, not from the status.
+            //
+            // This used to read `record.status == "COMPLETED"`, which claims a
+            // file was verified when nothing was ever compared against anything.
+            // The comparison itself only happens in the chunk handler, so a
+            // transfer finished by any other route -- or one whose digest
+            // mismatched and was turned into FAILED only in the local `verified`
+            // variable -- would still report sha256Verified = true here, and that
+            // is what the Receiver Hub and the notification render.
+            //
+            // No expected digest means nothing to verify against, so it is
+            // reported as false rather than assumed good.
+            sha256Verified = record.calculatedSha256 != null &&
+                record.expectedSha256 != null &&
+                record.expectedSha256.equals(record.calculatedSha256, ignoreCase = true),
             filePath = record.targetFile.absolutePath,
             senderName = record.senderName.ifBlank { null }
         )
