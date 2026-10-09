@@ -29,6 +29,33 @@ except ImportError:  # package-relative import when imported as desktop.embedded
 # longer be lost.
 record_server_history_entry = record_received_entry
 
+#: Where a superseded file goes when a new transfer of the same name claims the
+#: original name.  A timestamped rename rather than a delete: the earlier file is
+#: the result of a transfer that was verified on screen, and quietly destroying a
+#: user's file because they re-sent something is not a recoverable surprise.
+QUARANTINE_SUFFIX = ".superseded"
+
+
+def _quarantine(path: str) -> Optional[str]:
+    """Move `path` aside so a new transfer can use the original name.
+
+    Returns the new path, or None if it could not be moved -- in which case the
+    caller must not assume the name is free, because the next `open(..., "wb")`
+    would destroy the file that is still there.
+    """
+    try:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        target = f"{path}.{stamp}{QUARANTINE_SUFFIX}"
+        n = 1
+        while os.path.exists(target):
+            target = f"{path}.{stamp}-{n}{QUARANTINE_SUFFIX}"
+            n += 1
+        os.replace(path, target)
+        return target
+    except OSError:
+        return None
+
+
 class SpeedTracker:
     def __init__(self):
         self.last_time = time.time()
@@ -129,6 +156,75 @@ class EmbeddedReceiverServer:
     # Mirrors the Android receiver so either device can stop a push, and so the
     # 409/410 contract in docs/protocol.md is implemented on both ends rather
     # than only where it was first needed.
+
+    def _reconcile_with_disk(self, rec: dict) -> None:
+        """Re-derive a transfer's progress from the file it is writing to.
+
+        `received_bytes` is an in-memory counter, but the bytes actually live in a
+        file that anything on the machine can touch. Keeping the two in step is
+        what makes resume trustworthy:
+
+          * a file deleted or truncated underneath a live transfer used to leave
+            the receiver still claiming every byte, so it answered "in progress"
+            to a sender that had nothing left to send;
+          * a transfer that reached its full size without the final chunk
+            arriving -- because the sender saw `received_bytes` already at the
+            total and correctly sent nothing -- stayed `pending` for ever, and
+            the UI rendered that as 100% STREAMING indefinitely. Completion used
+            to be computed only inside the chunk handler, so a transfer with no
+            trailing chunk could never be finalised or hashed.
+
+        Idempotent and cheap: one `stat` per status query, and the digest is only
+        computed when the transfer is genuinely finished and still unverified.
+        """
+        if rec.get("status") in ("completed", "cancelled"):
+            return
+        path = rec.get("file_path")
+        if not path:
+            return
+        try:
+            actual = os.path.getsize(path) if os.path.exists(path) else 0
+        except OSError:
+            return
+
+        # The disk is the truth about how much exists. Never report more than is
+        # really there, because that number is what makes a sender skip work.
+        if actual < rec.get("received_bytes", 0):
+            rec["received_bytes"] = actual
+            if actual < rec.get("total_size", 0):
+                rec["status"] = "in_progress" if actual > 0 else "pending"
+
+        # A sender that uploaded nothing because it was told the transfer was
+        # already complete still owes us a completion decision.
+        if rec["received_bytes"] >= rec["total_size"] > 0:
+            if rec.get("calculated_sha256") is None:
+                self._finalise(rec)
+
+    def _finalise(self, rec: dict) -> None:
+        """Hash a finished file and mark the transfer complete.
+
+        Split out of the chunk handler so every route to "all the bytes are
+        present" ends in the same place -- the digest is computed once, and
+        `completed` is only ever set together with it.
+        """
+        path = rec.get("file_path")
+        if not path:
+            return
+        try:
+            hasher = hashlib.sha256()
+            with open(str(path), "rb") as f:
+                while b := f.read(256 * 1024):
+                    hasher.update(b)
+            calculated = hasher.hexdigest()
+        except OSError:
+            return
+
+        rec["calculated_sha256"] = calculated
+        expected = rec.get("expected_sha256")
+        if expected:
+            rec["sha256_verified"] = (calculated.lower() == expected.lower())
+        rec["status"] = "completed"
+        rec["speed_bytes_sec"] = 0
 
     def _refusal_marker_for(self, transfer_id: str) -> Optional[str]:
         """Why this session must not accept a chunk, or None if it may."""
@@ -346,6 +442,11 @@ class EmbeddedReceiverServer:
                             tid = parts[1]
                             rec = parent.transfers.get(tid)
                             if rec:
+                                # What the sender does next depends entirely on
+                                # this number, so it is re-checked against the
+                                # file on every query rather than trusted from
+                                # memory. See _reconcile_with_disk.
+                                parent._reconcile_with_disk(rec)
                                 self.send_response(200)
                                 self.send_header("Content-Type", "application/json")
                                 self._send_cors()
@@ -415,11 +516,45 @@ class EmbeddedReceiverServer:
                             "file_path": dest_path
                         }
                         
-                        # Check existing file size if resuming
+                        # Look for a partial file left by an interrupted attempt.
+                        #
+                        # The old rule was "if a file of this name exists and is
+                        # not larger than the transfer, treat it as progress".
+                        # That is wrong for the common case of re-sending a file
+                        # that was already received in full: a complete previous
+                        # file has exactly the same name and exactly the same
+                        # size, so it was adopted as 100% resume progress. The
+                        # sender then uploaded nothing, and because completion is
+                        # only computed when a chunk arrives (see the handler
+                        # below) the transfer sat at "pending" while the UI showed
+                        # 100% STREAMING for ever.
+                        #
+                        # A complete file is not progress -- it is the finished
+                        # result of an earlier, different transfer. Only a
+                        # genuinely *partial* file of a matching size can be
+                        # resumed, and a size mismatch means the file is not this
+                        # transfer at all.
                         if os.path.exists(dest_path):
                             existing_sz = os.path.getsize(dest_path)
-                            if existing_sz <= filesize:
+                            if 0 < existing_sz < filesize:
                                 rec["received_bytes"] = existing_sz
+                                rec["status"] = "in_progress"
+                            elif existing_sz >= filesize:
+                                # Complete (or over-long) file of the same name
+                                # from an earlier transfer. Start clean, and keep
+                                # the old one rather than silently overwriting a
+                                # file the user may still want.
+                                moved = _quarantine(dest_path)
+                                if moved is None:
+                                    # Could not move it aside. Give up on the
+                                    # original name rather than truncate a file
+                                    # we could not preserve, and let this transfer
+                                    # use a distinct name so the two cannot
+                                    # collide mid-write.
+                                    dest_path = f"{dest_path}.{tid}.part"
+                                    rec["file_path"] = dest_path
+                                with open(dest_path, "wb") as f:
+                                    pass
                         else:
                             # Touch / create empty file
                             with open(dest_path, "wb") as f:
@@ -522,22 +657,20 @@ class EmbeddedReceiverServer:
                             rec["speed_bytes_sec"] = speed
                             
                             is_complete = (new_received >= rec["total_size"])
+                            # Initialised up front: only the completed branch
+                            # assigns them, and the response below reads both
+                            # regardless of which branch ran.
                             calculated_sha = None
                             sha_verified = False
 
                             if is_complete:
-                                rec["status"] = "completed"
-                                # Calculate SHA-256
-                                hasher = hashlib.sha256()
-                                with open(dest_path, "rb") as f:
-                                    while b := f.read(256 * 1024):
-                                        hasher.update(b)
-                                calculated_sha = hasher.hexdigest()
-                                rec["calculated_sha256"] = calculated_sha
-                                if rec.get("expected_sha256"):
-                                    sha_verified = (calculated_sha.lower() == rec["expected_sha256"].lower())
-                                    rec["sha256_verified"] = sha_verified
-                                
+                                # One place decides "finished": hashes the file and
+                                # sets completed together, so no route through the
+                                # chunk handler can set completed without a digest.
+                                parent._finalise(rec)
+                                calculated_sha = rec.get("calculated_sha256")
+                                sha_verified = bool(rec.get("sha256_verified"))
+
                                 # Record into history database/JSON. Locked +
                                 # atomic, and never raises into the request handler.
                                 record_server_history_entry(rec, self.client_address)
