@@ -648,19 +648,79 @@ class EmbeddedTransferServer(private val context: Context, private val port: Int
                 put("received_bytes", r.receivedBytes)
                 put("status", r.status)
                 put("created_at", System.currentTimeMillis().toString())
+                // Same digest fields the per-transfer /status endpoint reports.
+                //
+                // They were missing here, so a client reading the list saw
+                // `sha256_verified: null` for a transfer that had in fact been
+                // verified -- measured on a real transfer, where /transfer/{id}
+                // /status returned a matching digest for the same transfer_id.
+                // Two endpoints describing one transfer must not disagree about
+                // whether it was verified, or a caller has no way to tell which
+                // one to believe.
+                put("expected_sha256", r.expectedSha256 ?: JSONObject.NULL)
+                put("calculated_sha256", r.calculatedSha256 ?: JSONObject.NULL)
+                // Derived rather than stored, so it cannot disagree with the
+                // digests beside it: a completed transfer is verified exactly
+                // when both digests are present and equal. Anything else is
+                // genuinely not yet known, and is reported as null rather than
+                // a misleading false.
+                val verifiedNow: Any = if (
+                    r.status == "COMPLETED" &&
+                    r.expectedSha256 != null &&
+                    r.calculatedSha256 != null &&
+                    r.expectedSha256.equals(r.calculatedSha256, ignoreCase = true)
+                ) true else JSONObject.NULL
+                put("sha256_verified", verifiedNow)
+                put("verified", verifiedNow)
             })
         }
         sendJson(output, 200, arr)
     }
 
+    /**
+     * Where a received file is written, and where the user will look for it.
+     *
+     * The public `Downloads/NexusFlow` folder is the right answer and is what
+     * this returns on a normal device: it is created by the app, so it exists
+     * and is writable, and a user browsing Downloads finds the file there.
+     *
+     * `getExternalFilesDir(null)` is a fallback for when that is *not* possible --
+     * a profile with no public storage, or a device where the folder cannot be
+     * created. It needs no permission at any API level and is visible under
+     * Android/data/<pkg>, so the file is still reachable rather than lost in
+     * private storage where no file manager can see it. `receivedFilesDirectory()`
+     * exposes whatever was chosen, so the UI opens the folder the bytes are
+     * actually in rather than assuming the public path.
+     */
     private fun getSaveDirectory(): File {
-        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val nexusDir = File(downloads, "NexusFlow")
-        if (!nexusDir.exists()) {
-            nexusDir.mkdirs()
+        val legacy = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "NexusFlow"
+        )
+        // Still the first choice where the platform actually permits it: on API
+        // 28 and below this is the real Downloads folder, which is where a user
+        // expects a received file to be.
+        @Suppress("DEPRECATION")
+        if (legacy.exists() && legacy.canWrite()) return legacy
+
+        val ext = context.getExternalFilesDir(null)
+        if (ext != null) {
+            val dir = File(ext, "NexusFlow")
+            if (dir.exists() || dir.mkdirs()) return dir
         }
-        return if (nexusDir.exists() && nexusDir.canWrite()) nexusDir else context.filesDir
+        // Last resort. Reported honestly by lastResortSavePath() below, because
+        // a file the user cannot find is not a successful transfer.
+        return context.filesDir
     }
+
+    /**
+     * The folder the UI should open when the user taps "received downloads".
+     *
+     * Asks the receiver rather than hard-coding the public Downloads path, so
+     * that if the fallback above ever does engage, the button opens the folder
+     * the bytes are actually in instead of one that was never written to.
+     */
+    fun receivedFilesDirectory(): File = getSaveDirectory()
 
     private fun calculateFileSha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")

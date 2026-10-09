@@ -714,6 +714,17 @@ class MainActivity : ComponentActivity() {
                                                     name,
                                                     DEFAULT_PORT
                                                 )
+                                                // Publish the live pairing token so a
+                                                // sender can authenticate by tapping
+                                                // this device, instead of needing the
+                                                // QR or a typed code. The receiver
+                                                // mints a fresh token on every start,
+                                                // so this has to be set at the same
+                                                // moment -- otherwise discovery keeps
+                                                // advertising a token that is already
+                                                // dead, and every tap fails with 401.
+                                                LanDiscovery.advertisedToken =
+                                                    embeddedServer?.authToken.orEmpty()
                                                 notifyUser(getString(R.string.msg_receiver_started, name))
                                             } else {
                                                 notifyUser(getString(R.string.msg_receiver_start_failed))
@@ -722,6 +733,9 @@ class MainActivity : ComponentActivity() {
                                             embeddedServer?.stop()
                                             nsdHelper?.unregisterService()
                                             LanDiscovery.stopAdvertising()
+                                            // Stop advertising a credential for a
+                                            // receiver that is no longer running.
+                                            LanDiscovery.advertisedToken = ""
                                             isReceiverRunning = false
                                             notifyUser(getString(R.string.msg_receiver_stopped))
                                         }
@@ -820,16 +834,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openReceivedDownloadsFolder() {
+        // Ask the receiver where it actually writes rather than hard-coding the
+        // public Downloads path, so the button cannot open a folder that this
+        // app never wrote to.
+        val dir = embeddedServer?.receivedFilesDirectory()
         try {
             val intent = Intent(Intent.ACTION_VIEW).apply {
-                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val nexusDir = File(downloads, "NexusFlow")
-                setDataAndType(Uri.parse(nexusDir.absolutePath), "*/*")
+                setDataAndType(Uri.parse(dir?.absolutePath), "*/*")
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
             startActivity(intent)
         } catch (e: Exception) {
-            notifyUser(getString(R.string.msg_files_saved_in))
+            // No file manager, or it refused the path. Say where the bytes are
+            // rather than failing silently.
+            notifyUser(getString(R.string.msg_files_saved_in, dir?.absolutePath ?: "?"))
         }
     }
 

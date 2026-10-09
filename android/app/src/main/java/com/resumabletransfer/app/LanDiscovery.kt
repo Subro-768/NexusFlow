@@ -69,6 +69,21 @@ object LanDiscovery {
     @Volatile private var servicePort: Int = 8000
     private var multicastLock: WifiManager.MulticastLock? = null
 
+    /**
+     * The pairing token published in discovery replies, so a sender can
+     * authenticate to this device by tapping it.
+     *
+     * Kept separate from the receiver's own `authToken` because these are
+     * different lifetimes: the receiver mints a fresh token every time it
+     * starts, while discovery is long-lived and only re-reads this whenever it
+     * is set. An empty value simply omits the field, which is what a peer that
+     * is not currently receiving should advertise.
+     */
+    @Volatile var advertisedToken: String = ""
+        set(value) {
+            field = value.trim()
+        }
+
     // ── Public API ─────────────────────────────────────────────────────────────
 
     fun startAdvertising(context: Context, name: String, port: Int) {
@@ -224,6 +239,20 @@ object LanDiscovery {
             .put("p", servicePort)
             .put("v", 1)
             .put("id", ownIp)
+            // The pairing token rides in the discovery reply, exactly as the
+            // desktop already does. Without it the two apps behave differently
+            // in a way the user experiences as a bug: tapping a discovered peer
+            // authenticates instantly when that peer is the Linux receiver, and
+            // always fails with a 401 when it is the phone. Measured on the wire,
+            // the phone's hello carried only {id, n, p, t, v}.
+            //
+            // This is a deliberate trade, and it is the same one lan_discovery.py
+            // already documents: discovery is unauthenticated UDP broadcast, so
+            // anything on the network can ask "who is out there?" and read this
+            // back. The token therefore proves only that a peer was told it --
+            // it stops a stranger scanning the network from writing files, and
+            // does not stop one who can already see the screen.
+            .put("tok", advertisedToken)
             .toString()
     }
 

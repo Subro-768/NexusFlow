@@ -104,7 +104,7 @@
     <string name="msg_receiver_started">Receiver Started — Broadcasting as \"%1$s\"</string>
     <string name="msg_receiver_start_failed">Could not start the receiver. Another app may be using the port.</string>
     <string name="msg_receiver_stopped">Receiver Server Stopped</string>
-    <string name="msg_files_saved_in">Files saved in Downloads/NexusFlow</string>
+    <string name="msg_files_saved_in">Files saved in %1$s</string>
     <string name="msg_pick_to_resume_history">Please pick \'%1$s\' to resume bytes</string>
     <string name="msg_select_file_to_resume">Please select the file from device to resume</string>
     <string name="msg_testing">Testing…</string>
